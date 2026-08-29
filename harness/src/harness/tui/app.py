@@ -1,5 +1,5 @@
 """The security-harness TUI: pick a program, run recon, browse ranked leads,
-scaffold a report — all menu/key driven, no commands to memorize."""
+scaffold + render a report, classify CVEs — all menu/key driven."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -23,6 +23,8 @@ from .. import engine, store
 from ..findings import finding_template
 from ..paths import ensure_dirs, hunts_dir, programs_file
 from ..programs import Program, Registry
+
+DEFAULT_CVE_URL = "http://localhost:8080"
 
 
 class AddProgramScreen(ModalScreen[dict | None]):
@@ -69,17 +71,22 @@ class AddProgramScreen(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class SearchScreen(ModalScreen[str | None]):
-    """Modal to enter a CVE search query."""
+class PromptScreen(ModalScreen[str | None]):
+    """Generic single-line prompt modal (used for CVE search and classify)."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
+    def __init__(self, title: str, placeholder: str) -> None:
+        super().__init__()
+        self._title = title
+        self._placeholder = placeholder
+
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Search cve-index", id="dialog-title")
-            yield Input(placeholder="e.g. nginx 1.18 path traversal", id="q")
+            yield Label(self._title, id="dialog-title")
+            yield Input(placeholder=self._placeholder, id="q")
             with Horizontal(id="dialog-buttons"):
-                yield Button("Search", variant="primary", id="go")
+                yield Button("Go", variant="primary", id="go")
                 yield Button("Cancel", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -87,6 +94,9 @@ class SearchScreen(ModalScreen[str | None]):
             self.dismiss(None)
         else:
             self.dismiss(self.query_one("#q", Input).value.strip() or None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -98,7 +108,9 @@ class HarnessApp(App[None]):
     BINDINGS = [
         Binding("r", "recon", "Recon"),
         Binding("s", "search", "Search CVEs"),
-        Binding("w", "report", "Write report"),
+        Binding("w", "report", "Scaffold report"),
+        Binding("e", "export", "Render report"),
+        Binding("c", "classify", "Classify"),
         Binding("a", "add", "Add program"),
         Binding("d", "delete", "Delete program"),
         Binding("q", "quit", "Quit"),
@@ -114,6 +126,7 @@ class HarnessApp(App[None]):
     # ---- layout --------------------------------------------------------
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static("checking components…", id="status")
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Label("Programs", classes="panel-title")
@@ -131,6 +144,33 @@ class HarnessApp(App[None]):
         leads = self.query_one("#leads", DataTable)
         leads.add_columns("Score", "Host", "Why", "CVEs")
         self.refresh_programs()
+        self.refresh_status()
+
+    # ---- component status bar -----------------------------------------
+    def _cve_url(self) -> str:
+        prog = self.registry.get(self.current_program) if self.current_program else None
+        return (prog.cve_index_url if prog else None) or DEFAULT_CVE_URL
+
+    @work(exclusive=True, group="status")
+    async def refresh_status(self) -> None:
+        avail = engine.available()
+        health = await engine.cve_index_health(self._cve_url())
+
+        def mark(ok: bool) -> str:
+            return "[green]✓[/green]" if ok else "[red]✗[/red]"
+
+        if health["up"]:
+            vec = health["vectors"]
+            idx = f"[green]● up[/green] ({vec:,} docs)" if isinstance(vec, int) else "[green]● up[/green]"
+        else:
+            idx = "[red]● down[/red]"
+        text = (
+            f" recon {mark(avail['recon'])}  ·  "
+            f"cve-index {idx}  ·  "
+            f"classifier {mark(avail['classifier'])}  ·  "
+            f"reporter {mark(avail['reporter'])}"
+        )
+        self.query_one("#status", Static).update(text)
 
     # ---- data refresh --------------------------------------------------
     def refresh_programs(self) -> None:
@@ -148,6 +188,7 @@ class HarnessApp(App[None]):
         self.current_program = name
         self.current_leads = store.load_leads(name)
         self.refresh_leads()
+        self.refresh_status()
 
     def refresh_leads(self) -> None:
         table = self.query_one("#leads", DataTable)
@@ -165,7 +206,7 @@ class HarnessApp(App[None]):
         title = self.current_program or "-"
         self.query_one("#detail", Static).update(
             f"Program [b]{title}[/b] — {len(self.current_leads)} leads. "
-            "[b]r[/b] recon · [b]w[/b] scaffold report on the highlighted lead."
+            "[b]r[/b] recon · [b]w[/b] scaffold · [b]e[/b] render · [b]c[/b] classify."
         )
 
     # ---- selection events ---------------------------------------------
@@ -190,6 +231,14 @@ class HarnessApp(App[None]):
             )
         lines.append(f"[dim]{lead.get('note', '')}[/dim]")
         self.query_one("#detail", Static).update("\n".join(lines))
+
+    def _selected_lead_index(self) -> int:
+        table = self.query_one("#leads", DataTable)
+        try:
+            key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+            return int(key.value)
+        except Exception:  # noqa: BLE001
+            return 0
 
     # ---- actions -------------------------------------------------------
     def action_add(self) -> None:
@@ -249,14 +298,14 @@ class HarnessApp(App[None]):
         self.notify(f"recon done: {len(leads)} candidate leads", severity="information")
 
     def action_search(self) -> None:
-        program = self.registry.get(self.current_program) if self.current_program else None
-        cve_url = (program.cve_index_url if program else None) or "http://localhost:8080"
+        cve_url = self._cve_url()
 
         def handle(query: str | None) -> None:
             if query:
                 self._run_search(query, cve_url)
 
-        self.push_screen(SearchScreen(), handle)
+        self.push_screen(PromptScreen("Search cve-index",
+                                      "e.g. nginx 1.18 path traversal"), handle)
 
     @work(exclusive=True)
     async def _run_search(self, query: str, cve_url: str) -> None:
@@ -280,13 +329,7 @@ class HarnessApp(App[None]):
         if not self.current_program or not self.current_leads:
             self.notify("no lead to scaffold", severity="warning")
             return
-        table = self.query_one("#leads", DataTable)
-        try:
-            row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
-            index = int(row_key.value)
-        except Exception:  # noqa: BLE001
-            index = 0
-        lead = self.current_leads[index]
+        lead = self.current_leads[self._selected_lead_index()]
         template = finding_template(self.current_program, lead)
         out_dir = hunts_dir() / self.current_program
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -295,10 +338,64 @@ class HarnessApp(App[None]):
         Path(path).write_text(template, encoding="utf-8")
         self.query_one("#detail", Static).update(
             f"[b]scaffold written:[/b] {path}\n"
-            "Fill the TODOs from your manual testing, then:\n"
-            f"  bounty-reporter render {path} --out ./out"
+            "Fill the TODOs from your manual testing, then press [b]e[/b] to render\n"
+            "the HackerOne + Bugcrowd + Markdown report."
         )
         self.notify(f"report scaffold → {path}")
+
+    def action_export(self) -> None:
+        if not self.current_program or not self.current_leads:
+            self.notify("no lead selected", severity="warning")
+            return
+        lead = self.current_leads[self._selected_lead_index()]
+        safe_host = lead.get("host", "lead").replace("/", "_")
+        path = hunts_dir() / self.current_program / f"finding-{safe_host}.yaml"
+        if not path.exists():
+            self.notify("no scaffold yet — press [w] first, then fill it in",
+                        severity="warning")
+            return
+        try:
+            result = engine.render_report(str(path))
+        except engine.ComponentMissing as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except ValueError as exc:
+            self.query_one("#detail", Static).update(
+                f"[yellow]can't render yet:[/yellow] {exc}"
+            )
+            self.notify("scaffold still has TODOs", severity="warning")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"render failed: {exc}", severity="error")
+            return
+        self.query_one("#detail", Static).update(
+            f"[b]report rendered[/b] — rating {result['rating']} "
+            f"(CVSS {result['cvss']})\n{result['out_dir']}/\n"
+            f"  {result['fingerprint']}.md · .hackerone.json · .bugcrowd.json"
+        )
+        self.notify(f"report → {result['out_dir']}")
+
+    def action_classify(self) -> None:
+        def handle(description: str | None) -> None:
+            if description:
+                self._run_classify(description)
+
+        self.push_screen(PromptScreen("Classify a CVE/finding description",
+                                      "paste a vulnerability description"), handle)
+
+    @work(thread=True, exclusive=True)
+    def _run_classify(self, description: str) -> None:
+        self.call_from_thread(self.notify, "classifying…")
+        try:
+            result = engine.classify(description)
+            msg = (f"[b]classification[/b]\n  severity: {result['severity']}\n"
+                   f"  cwe: {result['cwe']}\n[dim]raw: {result.get('raw', '')[:120]}[/dim]")
+        except engine.ComponentMissing as exc:
+            msg = f"[yellow]classifier unavailable:[/yellow] {exc}"
+        except Exception as exc:  # noqa: BLE001
+            msg = (f"[yellow]classifier not ready:[/yellow] {exc}\n"
+                   "[dim]needs a trained adapter (see cve-classifier README).[/dim]")
+        self.call_from_thread(self.query_one("#detail", Static).update, msg)
 
 
 def main() -> None:

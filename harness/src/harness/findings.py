@@ -54,3 +54,22 @@ def finding_template(program: str, lead: dict) -> str:
         "# Delete the _recon_context block before submitting.\n"
     )
     return header + yaml.safe_dump(stub, sort_keys=False, allow_unicode=True)
+
+
+_REQUIRED = ("vuln_type", "asset", "observed_result", "impact")
+
+
+def unfilled_todos(data: dict) -> list[str]:
+    """Which required fields still hold their TODO placeholder. A filled asset
+    is exempt (the scaffold pre-fills it with the real host)."""
+    todos: list[str] = []
+    for field in _REQUIRED:
+        value = data.get(field, "")
+        if isinstance(value, str) and value.strip().upper().startswith("TODO"):
+            todos.append(field)
+    steps = data.get("steps_to_reproduce") or []
+    if steps and all(
+        isinstance(s, str) and s.strip().upper().startswith("TODO") for s in steps
+    ):
+        todos.append("steps_to_reproduce")
+    return todos

@@ -2,6 +2,14 @@ Screen {
     layout: vertical;
 }
 
+#status {
+    height: 1;
+    width: 100%;
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+}
+
 #sidebar {
     width: 34;
     border-right: solid $panel;
@@ -58,6 +66,6 @@ Screen {
     margin-left: 2;
 }
 
-AddProgramScreen, SearchScreen {
+AddProgramScreen, PromptScreen {
     align: center middle;
 }

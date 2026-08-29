@@ -4,30 +4,41 @@ One TUI that drives the whole security-harness, so a hunt is menu-driven instead
 of four tools, four `cd`s, and a pile of env vars.
 
 ```
-┌─ security-harness ──────────────┐
-│ Programs            │ Leads       │
-│  > acme    14 leads │ 8 dev-api…  │
-│    globex   (-)     │ 6 jenkins…  │
-│                     │ …           │
-│                     ├─────────────┤
-│                     │ detail pane │
-└ r recon · s search · w report · a add · q quit ┘
+┌─ security-harness ───────────────────────────────┐
+│ recon ✓ · cve-index ● up (12,431) · classifier ✗ · reporter ✓ │
+│ Programs            │ Leads                        │
+│  > acme    14 leads │ 8 dev-api…                   │
+│    globex   (-)     │ 6 jenkins…                   │
+│                     ├──────────────────────────────┤
+│                     │ detail pane                  │
+└ r recon · s search · w scaffold · e render · c classify · a add · q ┘
 ```
 
 ## What it does
 
-- **Programs** — define a bug-bounty program once (scope + seeds); it's saved to
+- **Status bar** — at a glance, which components are available: recon installed?,
+  cve-index up + doc count?, classifier ready?, reporter installed?
+- **Programs** — define a bug-bounty program once (scope + seeds); saved to
   `~/.harness/programs.yaml` and reused. `a` to add, `d` to delete.
 - **`r` Recon** — runs `recon-orchestrator` for the selected program (scope-gated,
   rate-limited) and fills the Leads table with ranked candidates.
 - **Leads** — the triaged hosts, highest-priority first, with the signals that
   flagged them and any CVE matches. Select one to see detail.
 - **`s` Search** — query a running `cve-index` for CVEs without leaving the app.
-- **`w` Report** — scaffolds a `bounty-reporter` finding file for the highlighted
+- **`w` Scaffold** — writes a `bounty-reporter` finding file for the highlighted
   lead, pre-filled with the facts recon knows and **TODOs for the evidence you
   must supply by hand**. It never invents repro steps or impact.
+- **`e` Render** — after you fill the scaffold's TODOs, renders it to HackerOne +
+  Bugcrowd JSON + Markdown. It **refuses** while any TODO placeholder remains.
+- **`c` Classify** — classify a CVE/finding description (severity + CWE) via
+  `cve-classifier`. Shows a clear "needs training" message until a GPU-trained
+  adapter exists.
 
-Results persist per program under `~/hunts/<program>/`.
+Results and reports persist per program under `~/hunts/<program>/`.
+
+> **cve-index ingest** stays a shell command (`cve-index ingest`) on purpose —
+> it's a long, heavy job better run detached than from a TUI keypress. The status
+> bar shows whether the service is up.
 
 ## Install
 

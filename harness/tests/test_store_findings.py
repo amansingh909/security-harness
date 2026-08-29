@@ -1,7 +1,7 @@
 import yaml
 
 from harness import store
-from harness.findings import finding_template
+from harness.findings import finding_template, unfilled_todos
 
 
 def test_store_roundtrip(tmp_path, monkeypatch):
@@ -44,3 +44,25 @@ def test_finding_template_prefills_facts_and_todos():
     assert body["vuln_type"].startswith("TODO")
     assert body["impact"].startswith("TODO")
     assert all(step.startswith("TODO") for step in body["steps_to_reproduce"])
+
+
+def test_unfilled_todos_flags_placeholders():
+    scaffold = yaml.safe_load(finding_template("acme", {"host": "x.acme.com"}))
+    todos = unfilled_todos(scaffold)
+    # a fresh scaffold has every required field unfilled except the pre-filled asset
+    assert "vuln_type" in todos
+    assert "impact" in todos
+    assert "observed_result" in todos
+    assert "steps_to_reproduce" in todos
+    assert "asset" not in todos  # pre-filled from recon
+
+
+def test_unfilled_todos_empty_when_filled():
+    data = {
+        "vuln_type": "IDOR",
+        "asset": "https://x.acme.com/a",
+        "observed_result": "got another user's record",
+        "impact": "reads any user's data",
+        "steps_to_reproduce": ["log in as A", "request B's id", "observe leak"],
+    }
+    assert unfilled_todos(data) == []
