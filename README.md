@@ -30,10 +30,17 @@ finds and organizes attack surface for a human to verify.
 
 | Component | Repo | Role | Runtime |
 |-----------|------|------|---------|
+| **harness** | [`harness`](harness) | TUI/CLI front door that drives all of the below | Interactive TUI |
 | **cve-index** | [`cve-index`](cve-index) | Hybrid Elasticsearch + FAISS search over NVD + MITRE ATT&CK | Long-running service (API) |
 | **cve-classifier** | [`cve-classifier`](cve-classifier) | QLoRA fine-tune → CVE severity + CWE classification | GPU batch job / inference |
 | **recon-orchestrator** | [`recon-orchestrator`](recon-orchestrator) | Scope-gated, rate-limited recon → ranked candidate leads | Run-to-completion job |
 | **bounty-reporter** | [`bounty-reporter`](bounty-reporter) | Structured finding → HackerOne/Bugcrowd JSON + Markdown + CVSS | CLI |
+
+**Start here:** [`harness`](harness) is the front door — a Textual TUI where you
+define a program once, then press `r` to run recon, browse ranked leads, and `w`
+to scaffold a report. It calls the four components below so you don't have to
+juggle their individual commands. The per-component docs are still the reference
+for what each does under the hood.
 
 ## How they connect
 

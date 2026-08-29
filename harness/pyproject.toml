@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness"
+version = "0.1.0"
+description = "TUI/CLI control surface that drives the whole security-harness"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.60",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# The engine drives the sibling components; install them editable too:
+#   pip install -e ../recon-orchestrator -e ../bounty-reporter
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+harness = "harness.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

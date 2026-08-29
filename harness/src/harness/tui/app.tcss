@@ -1,0 +1,63 @@
+Screen {
+    layout: vertical;
+}
+
+#sidebar {
+    width: 34;
+    border-right: solid $panel;
+}
+
+#main {
+    width: 1fr;
+}
+
+.panel-title {
+    text-style: bold;
+    background: $panel;
+    padding: 0 1;
+    width: 100%;
+}
+
+#programs {
+    height: 1fr;
+}
+
+#leads {
+    height: 1fr;
+}
+
+#detail {
+    height: 10;
+    border-top: solid $panel;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* modal dialogs */
+#dialog {
+    align: center middle;
+    width: 60;
+    height: auto;
+    padding: 1 2;
+    background: $surface;
+    border: thick $primary;
+}
+
+#dialog-title {
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+#dialog-buttons {
+    height: auto;
+    padding-top: 1;
+    align-horizontal: right;
+}
+
+#dialog-buttons Button {
+    margin-left: 2;
+}
+
+AddProgramScreen, SearchScreen {
+    align: center middle;
+}
