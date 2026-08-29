@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Environments / secrets
+.venv*/
+venv/
+.env
+
+# Local data & artifacts
+**/data/*.jsonl
+**/data/*.index
+**/data/faiss_ids.json
+**/artifacts/
+**/out/
+*.log

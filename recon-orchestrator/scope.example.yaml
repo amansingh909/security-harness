@@ -1,0 +1,7 @@
+# Paste the program's scope table here. Exclusions always win over includes.
+in_scope:
+  - example.com
+  - "*.example.com"
+out_of_scope:
+  - admin.example.com
+  - "*.internal.example.com"

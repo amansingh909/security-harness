@@ -1,0 +1,36 @@
+program: example-program
+vuln_type: IDOR
+asset: https://app.example.com/api/v2/invoices/{id}
+affected_param: id
+cwe: CWE-639
+cvss_vector: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N
+summary: >
+  The invoice endpoint returns any invoice by numeric ID without checking that
+  the invoice belongs to the requesting user. Any authenticated user can
+  enumerate id values and read other customers' invoices.
+steps_to_reproduce:
+  - "Register two accounts: User A (attacker) and User B (victim). Note User B's invoice ID from their dashboard, e.g. 4021."
+  - "Log in as User A and capture the session cookie."
+  - "As User A, request GET /api/v2/invoices/4021 with User A's session."
+  - "Observe that User B's invoice is returned in full."
+observed_result: >
+  The response body contained User B's invoice including customer name, billing
+  address, and line items, despite the request carrying User A's session.
+poc_request: |
+  GET /api/v2/invoices/4021 HTTP/2
+  Host: app.example.com
+  Cookie: session=<User A's session>
+poc_response: |
+  { "id": 4021, "customer": "User B", "billing_address": "[redacted]",
+    "total": "$482.10", "items": [ ... ] }
+impact: >
+  Any authenticated user can read any other user's invoices by incrementing the
+  id. IDs are sequential, so the entire invoice table is enumerable, exposing
+  customer PII (names, billing addresses, purchase history). No privileges or
+  user interaction required.
+remediation: >
+  Enforce an ownership check on the invoice lookup: verify the invoice's
+  customer_id matches the authenticated user before returning it. Return 404
+  (not 403) for non-owned IDs to avoid confirming their existence.
+references:
+  - https://cwe.mitre.org/data/definitions/639.html
