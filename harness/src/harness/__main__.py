@@ -58,6 +58,41 @@ def _cmd_hunt(args: argparse.Namespace) -> None:
               f"{'; '.join(lead.get('signals', []))[:70]}")
 
 
+def _cmd_scan(args: argparse.Namespace) -> None:
+    """Run recon and scan for vulnerabilities (headless)."""
+    reg = Registry.load(programs_file())
+    program = reg.get(args.name)
+    if program is None:
+        raise SystemExit(f"unknown program '{args.name}' (see: harness list)")
+    runnable, why = program.is_runnable()
+    if not runnable:
+        raise SystemExit(f"program not runnable: {why}")
+
+    # Run reconnaissance first
+    leads = asyncio.run(engine.run_recon(program))
+
+    # Then scan for vulnerabilities
+    vulns = asyncio.run(engine.scan_for_vulns(program, leads))
+
+    # Output results
+    print(json.dumps({
+        "program": program.name,
+        "leads": len(leads),
+        "vulnerabilities": len(vulns),
+        "vuln_details": vulns
+    }, indent=2))
+
+    # Also print a summary to stdout
+    if vulns:
+        print(f"\nFound {len(vulns)} potential vulnerabilities:")
+        for vuln in vulns[:5]:  # Show first 5
+            print(f"  [{vuln.get('priority_score', 0)}] {vuln['host']}:{vuln['service'].get('port', '?')}")
+            if vuln.get('cves'):
+                print(f"    CVEs: {', '.join([c.get('id', 'unknown') for c in vuln['cves'][:3]])}")
+    else:
+        print("\nNo vulnerabilities found via CVE index scan.")
+
+
 def _cmd_tui(args: argparse.Namespace) -> None:
     from .tui.app import HarnessApp
 
@@ -84,6 +119,10 @@ def main() -> None:
     p_hunt = sub.add_parser("hunt", help="run recon for a program (headless)")
     p_hunt.add_argument("name")
     p_hunt.set_defaults(func=_cmd_hunt)
+
+    p_scan = sub.add_parser("scan", help="run recon and scan for vulnerabilities (headless)")
+    p_scan.add_argument("name")
+    p_scan.set_defaults(func=_cmd_scan)
 
     args = parser.parse_args()
     if not getattr(args, "command", None):

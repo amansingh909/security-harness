@@ -1,0 +1,446 @@
+"""Triage dashboard: generates a human-readable morning queue report.
+
+This module takes the JSON output from the nightly runner and generates
+a formatted dashboard for manual review, suitable for morning queue review.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+
+# HTML template for the dashboard
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recon Triage Dashboard - {timestamp}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        h1, h2, h3 {{
+            color: #2c3e50;
+        }}
+        .header {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }}
+        .stats {{
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }}
+        .stat-card {{
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            flex: 1;
+            min-width: 200px;
+        }}
+        .stat-number {{
+            font-size: 2em;
+            font-weight: bold;
+            color: #3498db;
+        }}
+        .stat-label {{
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }}
+        .section {{
+            background: white;
+            margin: 20px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }}
+        .section-header {{
+            background: #3498db;
+            color: white;
+            padding: 15px 20px;
+            font-size: 1.2em;
+        }}
+        .section-content {{
+            padding: 20px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 10px 0;
+        }}
+        th, td {{
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        th {{
+            background-color: #f8f9fa;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.85em;
+            letter-spacing: 0.5px;
+        }}
+        tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        .priority-high {{
+            background-color: #ffebee;
+            border-left: 4px solid #f44336;
+        }}
+        .priority-medium {{
+            background-color: #fff8e1;
+            border-left: 4px solid #ff9800;
+        }}
+        .priority-low {{
+            background-color: #fff3e0;
+            border-left: 4px solid #ffc107;
+        }}
+        .signals {{
+            font-size: 0.9em;
+            color: #555;
+        }}
+        .note {{
+            font-style: italic;
+            color: #7f8c8d;
+        }}
+        .failed-programs {{
+            background-color: #ffebee;
+        }}
+        .failed-programs .section-header {{
+            background: #c62828;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 40px;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🔍 Recon Triage Dashboard</h1>
+        <p>Generated at {timestamp}</p>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-number">{programs_ran}</div>
+            <div class="stat-label">Programs Scanned</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{programs_failed}</div>
+            <div class="stat-label">Programs Failed</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{total_findings}</div>
+            <div class="stat-label">Total Findings</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{high_priority}</div>
+            <div class="stat-label">High Priority (≥8)</div>
+        </div>
+    </div>
+
+    {failed_programs_section}
+
+    <div class="section">
+        <div class="section-header">
+            <h2>🎯 Morning Queue (Prioritized Findings)</h2>
+            <p>Findings are sorted by priority score (highest first). Review these targets manually.</p>
+        </div>
+        <div class="section-content">
+            {findings_table}
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Generated by Recon Orchestrator Triage Dashboard • {timestamp}</p>
+        <p>⚠️  Remember: All findings require manual verification. No exploitation was attempted.</p>
+    </div>
+</body>
+</html>
+"""
+
+def _get_priority_class(score: int) -> str:
+    """Get CSS class based on priority score."""
+    if score >= 8:
+        return "priority-high"
+    elif score >= 4:
+        return "priority-medium"
+    else:
+        return "priority-low"
+
+def _format_signals(signals: List[str]) -> str:
+    """Format signals for display."""
+    if not signals:
+        return "<em>No specific signals</em>"
+    return "<br>".join(f"• {signal}" for signal in signals)
+
+def generate_dashboard(json_input: str | Path | Dict[str, Any]) -> str:
+    """Generate an HTML dashboard from nightly runner output.
+
+    Args:
+        json_input: Either a file path to JSON output, JSON string, or parsed dict.
+
+    Returns:
+        HTML string containing the formatted dashboard.
+    """
+    # Parse input
+    if isinstance(json_input, (str, Path)):
+        if isinstance(json_input, str) and Path(json_input).exists():
+            # It's a file path
+            with open(json_input, encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            # It's a JSON string
+            data = json.loads(json_input)
+    elif isinstance(json_input, dict):
+        data = json_input
+    else:
+        raise ValueError("json_input must be a file path, JSON string, or dict")
+
+    # Extract data
+    programs_ran = len(data.get("ran", []))
+    programs_failed = len(data.get("failed", {}))
+    total_findings = data.get("queue_size", 0)
+    queue = data.get("queue", [])
+
+    # Count high priority findings (score >= 8)
+    high_priority = sum(1 for item in queue if item.get("priority_score", 0) >= 8)
+
+    # Generate failed programs section
+    failed_programs_section = ""
+    if data.get("failed"):
+        failed_items = "".join(
+            f"<li><strong>{program}</strong>: {error}</li>"
+            for program, error in data["failed"].items()
+        )
+        failed_programs_section = f'''
+    <div class="section failed-programs">
+        <div class="section-header">
+            <h2>❌ Failed Programs</h2>
+            <p>{programs_failed} program(s) failed to run:</p>
+        </div>
+        <div class="section-content">
+            <ul>{failed_items}</ul>
+        </div>
+    </div>
+'''
+
+    # Generate findings table
+    if not queue:
+        findings_table = '<p><em>No findings in the queue.</em></p>'
+    else:
+        rows = []
+        for item in queue:
+            score = item.get("priority_score", 0)
+            priority_class = _get_priority_class(score)
+
+            # Format URL (truncate if too long)
+            url = item.get("url") or "-"
+            if len(url) > 50:
+                url = url[:47] + "..."
+
+            # Format signals
+            signals = _format_signals(item.get("signals", []))
+
+            # Format note
+            note = item.get("note", "") or "-"
+            if len(note) > 100:
+                note = note[:97] + "..."
+
+            row = f'''
+            <tr class="{priority_class}">
+                <td>{item.get("program", "Unknown")}</td>
+                <td>{item.get("host", "Unknown")}</td>
+                <td>{url}</td>
+                <td>{score}</td>
+                <td class="signals">{signals}</td>
+                <td class="note">{note}</td>
+            </tr>
+            '''
+            rows.append(row)
+
+        findings_table = f'''
+        <table>
+            <thead>
+                <tr>
+                    <th>Program</th>
+                    <th>Host</th>
+                    <th>URL</th>
+                    <th>Priority</th>
+                    <th>Signals</th>
+                    <th>Note</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(rows)}
+            </tbody>
+        </table>
+        '''
+
+    # Generate final HTML
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return HTML_TEMPLATE.format(
+        timestamp=timestamp,
+        programs_ran=programs_ran,
+        programs_failed=programs_failed,
+        total_findings=total_findings,
+        high_priority=high_priority,
+        failed_programs_section=failed_programs_section,
+        findings_table=findings_table
+    )
+
+def generate_terminal_report(json_input: str | Path | Dict[str, Any]) -> str:
+    """Generate a terminal-friendly text report from nightly runner output.
+
+    Args:
+        json_input: Either a file path to JSON output, JSON string, or parsed dict.
+
+    Returns:
+        Formatted string suitable for terminal output.
+    """
+    # Parse input (reuse logic from generate_dashboard)
+    if isinstance(json_input, (str, Path)):
+        if isinstance(json_input, str) and Path(json_input).exists():
+            with open(json_input, encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = json.loads(json_input)
+    elif isinstance(json_input, dict):
+        data = json_input
+    else:
+        raise ValueError("json_input must be a file path, JSON string, or dict")
+
+    # Extract data
+    programs_ran = len(data.get("ran", []))
+    programs_failed = len(data.get("failed", {}))
+    total_findings = data.get("queue_size", 0)
+    queue = data.get("queue", [])
+
+    # Build report
+    lines = []
+    lines.append("=" * 60)
+    lines.append("🔍 RECON TRIAGE DASHBOARD - MORNING QUEUE")
+    lines.append("=" * 60)
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append("📊 SUMMARY")
+    lines.append(f"  Programs Scanned: {programs_ran}")
+    lines.append(f"  Programs Failed:  {programs_failed}")
+    lines.append(f"  Total Findings:   {total_findings}")
+    high_priority = sum(1 for item in queue if item.get("priority_score", 0) >= 8)
+    lines.append(f"  High Priority (≥8): {high_priority}")
+    lines.append("")
+
+    if data.get("failed"):
+        lines.append("❌ FAILED PROGRAMS")
+        lines.append("-" * 40)
+        for program, error in data["failed"].items():
+            lines.append(f"  {program}: {error}")
+        lines.append("")
+
+    lines.append("🎯 PRIORITIZED FINDINGS (Highest Priority First)")
+    lines.append("-" * 60)
+
+    if not queue:
+        lines.append("  No findings in the queue.")
+    else:
+        for i, item in enumerate(queue, 1):
+            score = item.get("priority_score", 0)
+            host = item.get("host", "Unknown")
+            program = item.get("program", "Unknown")
+            url = item.get("url") or "-"
+
+            # Priority indicator
+            if score >= 8:
+                priority_ind = "🔴 HIGH"
+            elif score >= 4:
+                priority_ind = "🟡 MED"
+            else:
+                priority_ind = "🟢 LOW"
+
+            lines.append(f"  {i:3d}. [{priority_ind}] Score: {score:2d} | {program:15s} | {host}")
+            if url and url != "-":
+                lines.append(f"       URL: {url}")
+
+            signals = item.get("signals", [])
+            if signals:
+                lines.append(f"       Signals: {', '.join(signals)}")
+
+            note = item.get("note")
+            if note:
+                lines.append(f"       Note: {note}")
+
+            lines.append("")
+
+    lines.append("=" * 60)
+    lines.append("⚠️  REMINDER: All findings require manual verification.")
+    lines.append("    No exploitation was attempted during scanning.")
+    lines.append("=" * 60)
+
+    return "\n".join(lines)
+
+def main() -> None:
+    """CLI entrypoint for the triage dashboard."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Generate a triage dashboard from nightly runner output"
+    )
+    parser.add_argument(
+        "input",
+        help="Path to JSON output file from nightly runner, or '-' for stdin"
+    )
+    parser.add_argument(
+        "--format",
+        choices=["html", "terminal"],
+        default="html",
+        help="Output format (default: html)"
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Output file path (default: stdout)"
+    )
+
+    args = parser.parse_args()
+
+    # Read input
+    if args.input == "-":
+        import sys
+        json_input = sys.stdin.read()
+    else:
+        json_input = args.input
+
+    # Generate report
+    if args.format == "html":
+        report = generate_dashboard(json_input)
+    else:
+        report = generate_terminal_report(json_input)
+
+    # Write output
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"Dashboard written to {args.output}", file=sys.stderr)
+    else:
+        print(report)
+
+if __name__ == "__main__":
+    main()

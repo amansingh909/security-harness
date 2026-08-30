@@ -76,6 +76,22 @@ cve-index ingest --mode full         # fetch → embed → index → alias-swap 
 cve-index serve                      # http://localhost:8080
 ```
 
+### 2. Run the full pipeline for all programs (optional one‑shot command)
+
+Once the services are up, you can execute the entire workflow for every defined program with a single command:
+
+```bash
+harness global
+```
+
+This will:
+- Run the nightly pipeline (sub‑domain enumeration → port sweep → CPE‑based CVE lookup → sensitive‑path checks → scope import → scoring).
+- Open the Triage dashboard so you can review ranked findings.
+- Generate a consolidated Markdown + JSON report for each program under `~/hunts/<program>/`.
+- Prompt once for HackerOne / Bugcrowd API keys (leave blank to skip upload) and, if supplied, POST the findings to the platforms.
+
+All steps remain GET/HEAD‑only for recon and POST‑only for upload, require manual review before any data leaves your machine, and respect the program‑level allow/deny lists.
+
 ### 2. (Optional) Train the CVE classifier on that corpus
 
 ```bash

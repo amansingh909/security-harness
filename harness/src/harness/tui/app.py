@@ -3,6 +3,7 @@ scaffold + render a report, classify CVEs — all menu/key driven."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import List, Dict, Any
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -74,6 +75,64 @@ class AddProgramScreen(ModalScreen[dict | None]):
 class PromptScreen(ModalScreen[str | None]):
     """Generic single-line prompt modal (used for CVE search and classify)."""
 
+
+class TriageScreen(ModalScreen[None]):
+    """Screen showing a ranked table of vulnerability findings across all programs."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, registry: Registry) -> None:
+        super().__init__()
+        self.registry = registry
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield DataTable(id="triage-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#triage-table", DataTable)
+        table.add_columns("Program", "Score", "Host:Port", "Service", "CVE Count", "Exploit", "Sensitive")
+        self._populate_table()
+
+    def _populate_table(self) -> None:
+        table = self.query_one("#triage-table", DataTable)
+        table.clear()
+        for prog_name in self.registry.names():
+            vulns = store.load_vulns(prog_name)
+            if not vulns:
+                continue
+            # Sort by priority_score descending
+            sorted_vulns = sorted(vulns, key=lambda v: v.get("priority_score", 0), reverse=True)
+            for v in sorted_vulns[:20]:  # limit to top 20 per program for brevity
+                score = v.get("priority_score", 0)
+                # Pick first service if multiple (should be one per vuln)
+                service_info = v.get("service", {})
+                host = service_info.get("host", "")
+                port = service_info.get("port", "")
+                scheme = service_info.get("scheme", "")
+                hostport = f"{host}:{port}" if port else host
+                service_desc = f"{scheme.upper()} {service_info.get('server','')} {service_info.get('powered_by','')}".strip()
+                cves = v.get("cves", [])
+                cve_count = len(cves)
+                exploit_flag = "✓" if any(c.get("exploit_available") for c in cves) else ""
+                # Sensitive flag: check if we stored extra fields (we will add later)
+                sensitive_flag = "✓" if v.get("sensitive_paths") or v.get("cookies") or v.get("cors_issues") else ""
+                table.add_row(
+                    prog_name,
+                    str(score),
+                    hostport,
+                    service_desc,
+                    str(cve_count),
+                    exploit_flag,
+                    sensitive_flag,
+                    key=f"{prog_name}_{hostport}"
+                )
+
+
+def main() -> None:
+    HarnessApp().run()
+
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def __init__(self, title: str, placeholder: str) -> None:
@@ -106,13 +165,17 @@ class HarnessApp(App[None]):
     CSS_PATH = "app.tcss"
     TITLE = "security-harness"
     BINDINGS = [
+        Binding("n", "nightly", "Nightly Run"),
+        Binding("t", "triage", "Triage"),
         Binding("r", "recon", "Recon"),
+        Binding("v", "scan", "Scan Vulns"),
         Binding("s", "search", "Search CVEs"),
         Binding("w", "report", "Scaffold report"),
         Binding("e", "export", "Render report"),
         Binding("c", "classify", "Classify"),
         Binding("a", "add", "Add program"),
         Binding("d", "delete", "Delete program"),
+        Binding("u", "upload", "Upload Report"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -206,7 +269,7 @@ class HarnessApp(App[None]):
         title = self.current_program or "-"
         self.query_one("#detail", Static).update(
             f"Program [b]{title}[/b] — {len(self.current_leads)} leads. "
-            "[b]r[/b] recon · [b]w[/b] scaffold · [b]e[/b] render · [b]c[/b] classify."
+            "[b]r[/b] recon · [b]v[/b] scan vulns · [b]w[/b] scaffold · [b]e[/b] render · [b]c[/b] classify."
         )
 
     # ---- selection events ---------------------------------------------
@@ -254,6 +317,82 @@ class HarnessApp(App[None]):
 
         self.push_screen(AddProgramScreen(), handle)
 
+    def action_nightly(self) -> None:
+        """Run the nightly pipeline for all programs (sub‑domain enum → port sweep → CPE → etc.)."""
+        if not self.registry.names():
+            self.notify("no programs defined", severity="warning")
+            return
+        self.notify("starting nightly run for all programs…")
+        # Run in a worker so the UI stays responsive
+        self._run_nightly_all()
+
+    @work(exclusive=True)
+    async def _run_nightly_all(self) -> None:
+        """Worker that runs the nightly orchestrator once and updates UI."""
+        try:
+            # Import here to avoid circular import issues
+            from ..recon_orchestrator.nightly.orchestrator import run_all_once
+            run_all_once()  # this function runs synchronously (asyncio.run inside)
+            # After run, refresh data for the currently selected program (if any)
+            if self.current_program:
+                self.current_leads = store.load_leads(self.current_program)
+                self.refresh_leads()
+                self.refresh_programs()
+            self.notify("nightly run completed", severity="information")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"nightly run failed: {exc}", severity="error")
+
+    def action_triage(self) -> None:
+        """Open the triage dashboard showing ranked findings across all programs."""
+        if not self.registry.names():
+            self.notify("no programs defined", severity="warning")
+            return
+        self.push_screen(TriageScreen(self.registry))
+
+    def action_upload(self) -> None:
+        """Generate a batch report and upload it to configured platforms."""
+        if not self.current_program:
+            self.notify("no program selected", severity="warning")
+            return
+        # Ensure we have leads (run recon if needed)
+        if not self.current_leads:
+            self.notify("no leads available – run recon first (press 'r')", severity="warning")
+            return
+        # Prompt for API keys once per session
+        def handle_keys(result: dict | None) -> None:
+            if not result:
+                return
+            h1_key = result.get("h1_key")
+            bc_key = result.get("bc_key")
+            self._do_upload(h1_key, bc_key)
+        self.push_screen(PromptScreen(
+            "Enter API keys (leave blank to skip that platform)",
+            "HackerOne API key,Bugcrowd API key (comma separated)"
+        ), handle_keys)
+
+    def _do_upload(self, h1_key: str | None, bc_key: str | None) -> None:
+        """Internal: generate report and call uploader."""
+        self.notify("generating batch report…")
+        try:
+            # Load vulns (if any) – if none, we can still upload empty? better to warn.
+            vulns = store.load_vulns(self.current_program)
+            if not vulns:
+                self.notify("no vulnerability findings to upload – run scan first (press 'v')", severity="warning")
+                return
+            # Generate report
+            from ..engine import render_batch_report
+            from pathlib import Path
+            out_dir = hunts_dir() / self.current_program
+            report_path = render_batch_report(self.current_program, vulns, out_dir)
+            self.notify(f"report generated: {report_path}")
+            # Upload
+            from ..bounty_reporter.uploader import upload_report
+            # Try both platforms; errors are caught inside uploader
+            upload_report(report_path, self.current_program, h1_key, bc_key)
+            self.notify("upload completed (check console for details)", severity="information")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"upload failed: {exc}", severity="error")
+
     def action_delete(self) -> None:
         if not self.current_program:
             return
@@ -266,7 +405,7 @@ class HarnessApp(App[None]):
             self.refresh_leads()
             self.notify(f"deleted program '{name}'", severity="warning")
 
-    def action_recon(self) -> None:
+    def action_scan(self) -> None:
         if not self.current_program:
             self.notify("no program selected", severity="warning")
             return
@@ -275,7 +414,7 @@ class HarnessApp(App[None]):
         if not runnable:
             self.notify(f"can't run: {why}", severity="error")
             return
-        self._run_recon(program)
+        self._run_scan(program)
 
     @work(exclusive=True)
     async def _run_recon(self, program: Program) -> None:
@@ -296,6 +435,35 @@ class HarnessApp(App[None]):
         self.refresh_leads()
         self.refresh_programs()
         self.notify(f"recon done: {len(leads)} candidate leads", severity="information")
+
+    @work(exclusive=True)
+    async def _run_scan(self, program: Program) -> None:
+        self.notify(f"scanning '{program.name}' for vulnerabilities…")
+        self.query_one("#detail", Static).update(
+            f"[b]scanning {program.name}[/b] — running recon + CVE search, please wait…"
+        )
+        try:
+            # Re-run recon to ensure fresh data
+            leads = await engine.run_recon(program)
+            store.save_leads(program.name, leads)
+            self.current_leads = leads
+            self.refresh_leads()
+
+            # Run vuln scan
+            vulns = await engine.scan_for_vulns(program, leads)
+
+            # Update view
+            if vulns:
+                msg = f"[b]scan done[/b] — found {len(vulns)} potential vulnerabilities."
+                self.notify(f"found {len(vulns)} potential vulnerabilities", severity="information")
+            else:
+                msg = "[b]scan done[/b] — no vulnerabilities identified."
+                self.notify("scan complete: no vulnerabilities identified", severity="information")
+            self.query_one("#detail", Static).update(msg)
+        except engine.ComponentMissing as exc:
+            self.notify(str(exc), severity="error")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"scan failed: {exc}", severity="error")
 
     def action_search(self) -> None:
         cve_url = self._cve_url()
