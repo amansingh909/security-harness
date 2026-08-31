@@ -213,7 +213,7 @@ class ReconOrchestrator:
             a for a in alerts
             if self._scope.verdict(alert_host(a) or host).status == "in"
         ]
-        signals, _score = alerts_to_signals(in_scope)
+        signals, _score = alerts_to_signals(in_scope, min_risk=self._s.zap_min_risk)
         return signals
 
     async def _run_builtin_active(self, prober: HttpProber, host: str, base: str) -> list[str]:

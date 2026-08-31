@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     zap_api_url: str | None = None       # e.g. http://localhost:8081
     zap_api_key: str | None = None
     zap_max_wait: float = 300.0          # seconds to wait for spider+ascan
+    # Minimum ZAP risk to surface. High/Medium are the real bugs; Low and
+    # Informational are the header/cookie/version-leak nits programs exclude,
+    # so they are dropped by default (and counted, not listed).
+    zap_min_risk: str = "Medium"         # High | Medium | Low | Informational
 
     # --- CVE correlation (optional) --------------------------------------
     cve_index_url: str | None = None     # e.g. http://localhost:8080

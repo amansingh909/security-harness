@@ -65,16 +65,32 @@ async def test_scan_drives_spider_ascan_then_alerts():
 
 # --- alert mapping -----------------------------------------------------------
 
-def test_alerts_to_signals_scores_by_risk_and_dedupes():
-    signals, score = alerts_to_signals(ALERTS)
-    # 4 distinct (name,url,param): High SQLi, Medium XSS, Low header, evil.com High
-    joined = " ".join(signals)
-    assert "SQL Injection" in joined and "/item" in joined and "'id'" in joined
-    assert "[ZAP High]" in joined and "[ZAP Medium]" in joined
+def test_alerts_to_signals_high_first_and_dedupes():
+    # default min_risk="Low" keeps Low, drops nothing here
+    signals, score = alerts_to_signals(ALERTS, min_risk="Low")
+    finding_lines = [s for s in signals if s.startswith("[ZAP")]
+    # highest risk leads
+    assert finding_lines[0].startswith("[ZAP High]")
     # the two identical SQLi alerts collapse to one
     assert sum("/item via 'id'" in s for s in signals) == 1
-    # High=15, Medium=8, Low=3, plus the evil.com High=15 (mapping doesn't gate scope)
-    assert score == 15 + 8 + 3 + 15
+    # High(x2 distinct) + Medium + Low = 15+15+8+3
+    assert score == 15 + 15 + 8 + 3
+
+
+def test_risk_filter_drops_low_noise_and_counts_it():
+    signals, score = alerts_to_signals(ALERTS, min_risk="Medium")
+    # the Low header nit is gone from the listed findings...
+    assert not any("X-Content-Type-Options" in s or "[ZAP Low]" in s for s in signals)
+    # ...but it is accounted for, not silently dropped
+    assert any("hidden" in s for s in signals)
+    # only High + Medium contribute to the score now
+    assert score == 15 + 15 + 8
+
+
+def test_high_only_filter():
+    signals, _ = alerts_to_signals(ALERTS, min_risk="High")
+    listed = [s for s in signals if s.startswith("[ZAP")]
+    assert listed and all(s.startswith("[ZAP High]") for s in listed)
 
 
 # --- orchestrator integration ------------------------------------------------

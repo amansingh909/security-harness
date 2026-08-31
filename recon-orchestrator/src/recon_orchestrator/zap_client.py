@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 # ZAP risk -> priority score. A High-risk ZAP alert (e.g. SQLi) far outweighs a
 # passive header nit, but stays a *lead* to verify, not a confirmed bug.
 _RISK_SCORE = {"High": 15, "Medium": 8, "Low": 3, "Informational": 1}
+_RISK_ORDER = {"High": 3, "Medium": 2, "Low": 1, "Informational": 0}
 
 
 class ZapError(RuntimeError):
@@ -93,18 +94,26 @@ def alert_host(alert: dict) -> str:
     return urlparse(alert.get("url", "")).hostname or ""
 
 
-def alerts_to_signals(alerts: list[dict]) -> tuple[list[str], int]:
-    """Turn ZAP alerts into (signals, total_score).
+def alerts_to_signals(
+    alerts: list[dict], min_risk: str = "Low"
+) -> tuple[list[str], int]:
+    """Turn ZAP alerts into (signals, total_score), highest risk first.
 
-    De-duplicates by (alert name, url, param) so the same issue on the same
-    endpoint is reported once.
+    Alerts below ``min_risk`` are dropped — those are the missing-header,
+    cookie-flag and version-leak nits that programs exclude — and the count of
+    what was hidden is appended as one line so nothing silently vanishes.
+    De-duplicates by (alert name, url, param).
     """
     from urllib.parse import urlparse
 
+    floor = _RISK_ORDER.get(min_risk, 0)
+    ranked = sorted(alerts, key=lambda a: -_RISK_ORDER.get(a.get("risk", "Low"), 0))
+
     signals: list[str] = []
     score = 0
+    hidden = 0
     seen: set[tuple[str, str, str]] = set()
-    for a in alerts:
+    for a in ranked:
         name = a.get("alert") or a.get("name") or "ZAP alert"
         risk = a.get("risk", "Low")
         url = a.get("url", "")
@@ -113,8 +122,15 @@ def alerts_to_signals(alerts: list[dict]) -> tuple[list[str], int]:
         if key in seen:
             continue
         seen.add(key)
+        if _RISK_ORDER.get(risk, 0) < floor:
+            hidden += 1
+            continue
         path = urlparse(url).path or "/"
         where = f" at {path}" + (f" via '{param}'" if param else "")
         signals.append(f"[ZAP {risk}] {name}{where} — verify manually")
         score += _RISK_SCORE.get(risk, 1)
+
+    if hidden:
+        signals.append(f"({hidden} lower-risk ZAP alert(s) hidden — "
+                       f"lower zap_min_risk to see them)")
     return signals, score
