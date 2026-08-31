@@ -40,6 +40,13 @@ async def run_recon(program: Program) -> list[dict]:
             raise ComponentMissing(f"seeds_file unreadable: {exc}") from exc
 
     import os
+    # A Vercel protection-bypass secret (env) lets a scan reach a protected
+    # preview; sent as the header Vercel checks, on every request.
+    extra_headers: dict[str, str] = {}
+    bypass = os.getenv("VERCEL_AUTOMATION_BYPASS_SECRET")
+    if bypass:
+        extra_headers["x-vercel-protection-bypass"] = bypass
+        extra_headers["x-vercel-set-bypass-cookie"] = "true"
     settings = Settings(
         requests_per_second=program.requests_per_second,
         cve_index_url=program.cve_index_url,
@@ -49,6 +56,7 @@ async def run_recon(program: Program) -> list[dict]:
         use_zap=program.use_zap,
         zap_api_url=os.getenv("ZAP_API_URL"),
         zap_api_key=os.getenv("ZAP_API_KEY"),
+        extra_request_headers=extra_headers,
     )
     scope = ScopeGuard(
         program.in_scope, program.out_of_scope, program.allow_multilevel_wildcard

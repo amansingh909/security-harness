@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +37,10 @@ class Settings(BaseSettings):
     backoff_max: float = 30.0
     user_agent: str = "recon-orchestrator/0.1 (authorized security testing)"
     verify_tls: bool = True
+    # Extra headers added to every request (passive probe, built-in active
+    # tester, and ZAP). Used to carry a Vercel deployment-protection bypass
+    # token so a scan can reach a protected preview you own.
+    extra_request_headers: dict[str, str] = Field(default_factory=dict)
 
     # --- recon depth -----------------------------------------------------
     # Discovery + enrichment stages. Subdomain enum (passive, crt.sh) and

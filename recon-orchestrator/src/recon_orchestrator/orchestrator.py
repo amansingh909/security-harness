@@ -202,9 +202,18 @@ class ReconOrchestrator:
             log.warning("use_zap set but ZAP_API_URL / ZAP_API_KEY are missing",
                         extra={"host": host})
             return []
+        extra = self._s.extra_request_headers or {}
         try:
             async with ZapClient(self._s.zap_api_url, self._s.zap_api_key) as zap:
-                alerts = await zap.scan(base, max_wait=self._s.zap_max_wait)
+                # Carry bypass/auth headers through ZAP so a protected preview
+                # is reachable; clean the rules up afterward.
+                for hname, hval in extra.items():
+                    await zap.add_request_header(hname, hval)
+                try:
+                    alerts = await zap.scan(base, max_wait=self._s.zap_max_wait)
+                finally:
+                    for hname in extra:
+                        await zap.remove_request_header(hname)
         except Exception as exc:  # noqa: BLE001 - ZAP down / unreachable
             log.warning("ZAP scan failed", extra={"host": host, "error": str(exc)})
             return []

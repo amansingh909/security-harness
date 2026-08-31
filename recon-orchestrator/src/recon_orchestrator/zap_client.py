@@ -72,6 +72,30 @@ class ZapClient:
         log.warning("ZAP scan did not finish within budget",
                     extra={"action": action, "url": url, "max_wait": max_wait})
 
+    async def add_request_header(self, name: str, value: str) -> None:
+        """Make ZAP send ``name: value`` on every request (spider + scan).
+
+        Uses ZAP's Replacer so a protected preview can be reached with a
+        bypass token. Best-effort — a failure just means the header is not set.
+        """
+        try:
+            await self._get(
+                "replacer/action/addRule",
+                description=f"harness:{name}", enabled="true",
+                matchType="REQ_HEADER", matchRegex="false",
+                matchString=name, replacement=value, initiators="",
+            )
+        except ZapError as exc:
+            log.warning("could not add ZAP header rule",
+                        extra={"header": name, "error": str(exc)})
+
+    async def remove_request_header(self, name: str) -> None:
+        try:
+            await self._get("replacer/action/removeRule",
+                            description=f"harness:{name}")
+        except ZapError:
+            pass
+
     async def alerts(self, baseurl: str) -> list[dict]:
         data = await self._get("core/view/alerts", baseurl=baseurl)
         return data.get("alerts", [])

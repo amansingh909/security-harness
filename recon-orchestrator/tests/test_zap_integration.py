@@ -16,10 +16,17 @@ from recon_orchestrator.scope import ScopeGuard
 from recon_orchestrator.zap_client import ZapClient, alerts_to_signals
 
 
-def _zap_transport(alerts):
-    """A mock ZAP: scans report done immediately, alerts view returns `alerts`."""
+def _zap_transport(alerts, seen_headers=None):
+    """A mock ZAP: scans report done immediately, alerts view returns `alerts`.
+    If seen_headers is a list, replacer addRule calls are recorded into it."""
     def handler(request: httpx.Request) -> httpx.Response:
         p = request.url.path
+        if p.endswith("/replacer/action/addRule/"):
+            if seen_headers is not None:
+                seen_headers.append(dict(request.url.params).get("matchString"))
+            return httpx.Response(200, json={"Result": "OK"})
+        if p.endswith("/replacer/action/removeRule/"):
+            return httpx.Response(200, json={"Result": "OK"})
         if p.endswith("/spider/action/scan/"):
             return httpx.Response(200, json={"scan": "0"})
         if p.endswith("/spider/view/status/"):
@@ -124,6 +131,35 @@ async def test_orchestrator_uses_zap_and_scope_gates_alerts(monkeypatch):
     assert not any("evil.com" in s for s in all_signals)
     # and no evil.com finding exists
     assert all("evil.com" not in f.host for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_zap_sets_bypass_header_before_scanning(monkeypatch):
+    """A protected preview needs a bypass header on every ZAP request; the
+    orchestrator installs it as a Replacer rule before scanning."""
+    seen: list[str] = []
+    settings = Settings(active_tests=True, use_zap=True,
+                        zap_api_url="http://zap", zap_api_key="k",
+                        enable_subdomain_enum=False, enable_sensitive_checks=False,
+                        extra_request_headers={"x-vercel-protection-bypass": "s3cret"})
+    scope = ScopeGuard(["*.demo.local", "demo.local"], [])
+    orch = ReconOrchestrator(settings, scope)
+
+    import recon_orchestrator.zap_client as zc
+    real_init = zc.ZapClient.__init__
+
+    def patched_init(self, api_url, api_key, timeout=30.0, transport=None, poll_interval=3.0):
+        real_init(self, api_url, api_key, timeout=timeout,
+                  transport=_zap_transport(ALERTS, seen_headers=seen), poll_interval=0)
+    monkeypatch.setattr(zc.ZapClient, "__init__", patched_init)
+
+    class P:
+        async def probe(self, host): return HostProbe(host=host, status=200, port=443)
+        async def send(self, r): raise AssertionError("built-in tester must not run")
+        async def aclose(self): pass
+
+    await orch.run(["demo.local"], prober=P())
+    assert "x-vercel-protection-bypass" in seen, "bypass header rule was not added to ZAP"
 
 
 @pytest.mark.asyncio

@@ -64,8 +64,12 @@ class HttpProber:
             max_keepalive_connections=settings.max_concurrency,
         )
         timeout = httpx.Timeout(settings.http_timeout, connect=settings.connect_timeout)
+        # Extra headers (e.g. a Vercel protection-bypass token) go on every
+        # request the prober makes — passive probes and the built-in tester.
+        headers = {"User-Agent": settings.user_agent}
+        headers.update(settings.extra_request_headers or {})
         self._client = httpx.AsyncClient(
-            headers={"User-Agent": settings.user_agent},
+            headers=headers,
             timeout=timeout,
             limits=limits,
             verify=settings.verify_tls,
