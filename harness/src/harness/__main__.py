@@ -171,8 +171,10 @@ def _cmd_preview(args: argparse.Namespace) -> None:
     from .vercel import host_from_url, latest_preview_host
 
     host = host_from_url(args.target)
+    project = None
     if host is None:
         # Not a URL — treat as a Vercel project name and resolve via the API.
+        project = args.target
         token = os.getenv("VERCEL_TOKEN")
         if not token:
             raise SystemExit(
@@ -185,10 +187,14 @@ def _cmd_preview(args: argparse.Namespace) -> None:
         except (PermissionError, LookupError, RuntimeError) as exc:
             raise SystemExit(str(exc))
 
-    if host.endswith((".prod.vercel.app",)) or host in ("vercel.app",):
+    if host in ("vercel.app",):
         raise SystemExit(f"refusing: {host!r} does not look like a preview host")
 
-    name = args.program or (host.split(".")[0] + "-preview")
+    # A project resolves to a STABLE name so re-running after a new deploy
+    # updates the same program (and re-targets the latest preview) rather than
+    # piling up one program per deployment hash.
+    name = args.program or (f"{project}-preview" if project
+                            else host.split(".")[0] + "-preview")
     ensure_dirs()
     reg = Registry.load(programs_file())
     existing = reg.get(name)
