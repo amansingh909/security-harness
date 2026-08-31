@@ -11,6 +11,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -67,6 +68,8 @@ class AddProgramScreen(ModalScreen[dict | None]):
             yield Input(placeholder="in-scope, comma sep (e.g. *.acme.com)", id="f-in")
             yield Input(placeholder="out-of-scope, comma sep (optional)", id="f-out")
             yield Input(placeholder="seeds, comma sep (optional)", id="f-seeds")
+            yield Checkbox("Active testing — OWNED ASSETS ONLY", id="f-active")
+            yield Checkbox("Use OWASP ZAP engine (needs active testing)", id="f-zap")
             with Horizontal(id="dialog-buttons"):
                 yield Button("Save", variant="primary", id="save")
                 yield Button("Cancel", id="cancel")
@@ -76,11 +79,18 @@ class AddProgramScreen(ModalScreen[dict | None]):
             self.dismiss(None)
             return
 
+        # ZAP implies active testing; active testing must be explicit.
+        active = self.query_one("#f-active", Checkbox).value
+        use_zap = self.query_one("#f-zap", Checkbox).value
+        if use_zap:
+            active = True
+
         # A handle takes the import path; the manual fields are ignored so the
         # two ways of adding a program never fight over the same submit.
         handle = self.query_one("#f-handle", Input).value.strip()
         if handle:
-            self.dismiss({"import_handle": handle})
+            self.dismiss({"import_handle": handle,
+                          "active_tests": active, "use_zap": use_zap})
             return
 
         name = self.query_one("#f-name", Input).value.strip()
@@ -102,6 +112,8 @@ class AddProgramScreen(ModalScreen[dict | None]):
             # rarely changed and stay editable in programs.yaml for the odd case.
             "seeds_file": None,
             "cve_index_url": DEFAULT_CVE_URL,
+            "active_tests": active,
+            "use_zap": use_zap,
         })
 
     def action_cancel(self) -> None:
@@ -198,8 +210,13 @@ class HelpScreen(ModalScreen[None]):
 [b]Programs[/b]              [b]Per lead[/b]
   a  add / import H1      s  search the CVE index
   i  import H1 scope      c  classify a description
-  d  delete (confirms)    w  scaffold a report
-  n  nightly: all progs   e  render a report
+  z  active/ZAP mode      w  scaffold a report
+  d  delete (confirms)    e  render a report
+  n  nightly: all progs
+
+[b]Active testing[/b] (OWNED ASSETS ONLY) — [b]z[/b] cycles a program
+  off -> active (built-in) -> active + ZAP -> off. Then [b]r[/b] recon runs
+  it; ZAP findings land in the leads/triage. ZAP creds come from ~/.harness/.env.
 
 [b]Anywhere[/b]
   t  triage      u  upload      q  quit      ?  this help
@@ -297,6 +314,7 @@ class HarnessApp(App[None]):
         Binding("q", "quit", "Quit"),
         # hidden from the footer, discoverable via `?`
         Binding("i", "import_scope", "Import H1 scope", show=False),
+        Binding("z", "toggle_active", "Active/ZAP mode", show=False),
         Binding("n", "nightly", "Nightly run", show=False),
         Binding("s", "search", "Search CVEs", show=False),
         Binding("w", "report", "Scaffold report", show=False),
@@ -372,10 +390,18 @@ class HarnessApp(App[None]):
         table = self.query_one("#programs", DataTable)
         table.clear()
         for name in self.registry.names():
+            prog = self.registry.get(name)
             n_leads = len(store.load_leads(name))
             last = store.last_run(name)
             last_str = last.strftime("%m-%d %H:%M") if last else "-"
-            table.add_row(name, str(n_leads) if n_leads else "-", last_str, key=name)
+            # Mark active-testing programs so an armed target is never a surprise.
+            if prog and prog.use_zap:
+                label = Text.assemble(name, ("  ⚡ZAP", "bold red"))
+            elif prog and prog.active_tests:
+                label = Text.assemble(name, ("  ⚡active", "bold yellow"))
+            else:
+                label = name
+            table.add_row(label, str(n_leads) if n_leads else "-", last_str, key=name)
         if self.registry.names() and self.current_program is None:
             self.select_program(self.registry.names()[0])
 
@@ -442,7 +468,9 @@ class HarnessApp(App[None]):
                 return
             # A HackerOne handle routes to the import flow instead of a manual add.
             if "import_handle" in result:
-                self._do_import_scope(result["import_handle"])
+                self._do_import_scope(result["import_handle"],
+                                      active_tests=result.get("active_tests", False),
+                                      use_zap=result.get("use_zap", False))
                 return
             self.registry.add(Program(**result))
             self.registry.save(programs_file())
@@ -470,7 +498,8 @@ class HarnessApp(App[None]):
         )
 
     @work(exclusive=True)
-    async def _do_import_scope(self, program_handle: str) -> None:
+    async def _do_import_scope(self, program_handle: str,
+                               active_tests: bool = False, use_zap: bool = False) -> None:
         try:
             from recon_orchestrator.hackerone_scope import fetch_structured_scopes
         except ImportError:
@@ -509,6 +538,7 @@ class HarnessApp(App[None]):
             self.registry.add(Program(
                 name=program_handle, in_scope=in_scope, out_of_scope=out_scope,
                 seeds=seeds, seeds_file=None, cve_index_url=DEFAULT_CVE_URL,
+                active_tests=active_tests, use_zap=use_zap,
             ))
             verb = f"created with {len(seeds)} seed(s)"
         else:
@@ -664,6 +694,50 @@ class HarnessApp(App[None]):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_toggle_active(self) -> None:
+        """Cycle the selected program's active-testing mode:
+        off -> built-in active -> ZAP -> off. Arming asks for confirmation,
+        because it sends crafted attack traffic — owned assets only."""
+        if not self.current_program:
+            self.notify("no program selected", severity="warning")
+            return
+        name = self.current_program
+        prog = self.registry.get(name)
+        if prog is None:
+            return
+
+        # Determine the next state in the cycle.
+        if not prog.active_tests:
+            next_active, next_zap, label = True, False, "active (built-in)"
+        elif prog.active_tests and not prog.use_zap:
+            next_active, next_zap, label = True, True, "active + ZAP"
+        else:
+            next_active, next_zap, label = False, False, "off"
+
+        def apply() -> None:
+            self.registry.add(prog.model_copy(
+                update={"active_tests": next_active, "use_zap": next_zap}))
+            self.registry.save(programs_file())
+            self.refresh_programs()
+            self.select_program(name)
+            self.notify(f"'{name}': active testing -> {label}",
+                        severity="warning" if next_active else "information")
+
+        if next_active and not prog.active_tests:
+            # Arming from off — confirm, since this enables attack traffic.
+            def confirmed(ok: bool | None) -> None:
+                if ok:
+                    apply()
+            self.push_screen(
+                ConfirmScreen(
+                    f"Enable active testing on '{name}'? This sends crafted "
+                    "attack traffic — only for assets you own.",
+                    confirm_label="Enable"),
+                confirmed,
+            )
+        else:
+            apply()
 
     def action_delete(self) -> None:
         if not self.current_program:
