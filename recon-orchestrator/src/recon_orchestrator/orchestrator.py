@@ -174,31 +174,60 @@ class ReconOrchestrator:
         return signals, score
 
     async def _run_active_tests(self, prober: HttpProber, host: str) -> list[str]:
-        """Send crafted-input tests against ``host`` — OWNED ASSETS ONLY.
+        """Crafted-input tests against a host's DISCOVERED inputs — OWNED ASSETS ONLY.
 
-        Reached only when ``active_tests`` is set. Requests go through the
-        prober's rate limiter (no bypass), and detection is signature/marker
-        based so a signal means the response actually showed something, not
-        merely that a request returned 200.
+        Reached only when ``active_tests`` is set. Fetches the page, extracts the
+        real links/GET-form parameters, scope-checks each endpoint, then injects
+        the payloads into those parameters. Requests go through the prober's rate
+        limiter, and detection is marker/signature based so a signal means the
+        response actually showed something.
         """
-        from . import payloads
+        import httpx
 
-        # Loud, per-host record that active traffic was sent — this is the mode
-        # that must never touch a target you do not control.
+        from . import payloads
+        from .active_discovery import extract_injection_points, inject
+
+        # Loud, per-host record that active traffic is being sent — this is the
+        # mode that must never touch a target you do not control.
         log.warning("active tests enabled — sending crafted input to owned target",
                     extra={"host": host})
 
+        # 1. Fetch the page to discover its inputs.
+        try:
+            page = await prober.send(httpx.Request("GET", f"https://{host}/"))
+        except Exception:  # noqa: BLE001
+            return []
+        points = extract_injection_points(str(page.url), page.text or "")
+        if not points:
+            log.info("active tests: no injectable parameters found",
+                     extra={"host": host})
+            return []
+
+        # 2. Inject into each in-scope discovered parameter.
         signals: list[str] = []
-        for test, req in payloads.build_requests(f"https://{host}"):
+        seen: set[str] = set()
+        for point in points:
             if self._shutdown.is_set():
                 break
-            try:
-                resp = await prober.send(req)
-            except Exception:  # noqa: BLE001 - network/protocol error, skip
+            # Never send payloads to a host the scope does not authorize, even
+            # if the page linked to it.
+            if self._scope.verdict(point.host or host).status != "in":
                 continue
-            signal = payloads.interpret(test, resp.text or "")
-            if signal:
-                signals.append(signal)
+            for test in payloads.TESTS:
+                if self._shutdown.is_set():
+                    break
+                try:
+                    resp = await prober.send(
+                        httpx.Request("GET", inject(point, test.value))
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                desc = payloads.interpret(test, resp.text or "")
+                if desc:
+                    signal = f"{desc} at {point.path} via '{point.param}'"
+                    if signal not in seen:
+                        seen.add(signal)
+                        signals.append(signal)
         return signals
 
     async def run(self, seeds: list[str], prober: HttpProber | None = None) -> list[CandidateFinding]:

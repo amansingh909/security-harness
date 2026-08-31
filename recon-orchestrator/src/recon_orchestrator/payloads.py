@@ -21,10 +21,7 @@ Design choices that keep detection honest and low-false-positive:
 """
 from __future__ import annotations
 
-import urllib.parse
 from dataclasses import dataclass
-
-import httpx
 
 # A token unlikely to occur naturally; if it comes back verbatim, our input was
 # reflected without encoding.
@@ -43,49 +40,29 @@ SQL_ERROR_SIGNATURES: tuple[str, ...] = (
 class ActiveTest:
     name: str
     kind: str        # "reflection" | "sql_error"
-    param: str
-    value: str
+    value: str       # the payload injected into a discovered parameter
 
 
 # The default set. Each vector is detectable from the response it provokes.
+# The parameter to inject into comes from endpoint discovery, not from here.
 TESTS: tuple[ActiveTest, ...] = (
-    ActiveTest("reflected-input", "reflection", "q", _XSS_MARKER),
-    ActiveTest("sql-error", "sql_error", "id", "'\"`)"),
+    ActiveTest("reflected-input", "reflection", _XSS_MARKER),
+    ActiveTest("sql-error", "sql_error", "'\"`)"),
 )
 
 
-def _with_query(base: str, param: str, value: str) -> str:
-    """Append ``param=value`` to ``base`` with correct URL encoding."""
-    sep = "&" if "?" in base else "?"
-    return f"{base}{sep}{param}={urllib.parse.quote(value)}"
-
-
-def build_requests(base_url: str) -> list[tuple[ActiveTest, httpx.Request]]:
-    """Build a (test, request) pair for each vector.
-
-    Injects into a query parameter with a GET — the request shape a reflected
-    or error-based issue on a page parameter would surface through. Returns the
-    test alongside the request so the caller knows how to interpret the
-    response.
-    """
-    out: list[tuple[ActiveTest, httpx.Request]] = []
-    for test in TESTS:
-        url = _with_query(base_url, test.param, test.value)
-        out.append((test, httpx.Request("GET", url)))
-    return out
-
-
 def interpret(test: ActiveTest, body: str) -> str | None:
-    """Return a signal string if the response indicates the test fired, else None."""
+    """Return a vuln description if the response shows the test fired, else None.
+
+    The caller tags this with the endpoint and parameter it was fired at.
+    """
     if not body:
         return None
     if test.kind == "reflection":
         if test.value in body:
-            return (f"reflected input via '{test.param}' (unencoded) — "
-                    "possible XSS, verify manually")
+            return "reflected input (unencoded) — possible XSS"
     elif test.kind == "sql_error":
         low = body.lower()
         if any(sig in low for sig in SQL_ERROR_SIGNATURES):
-            return (f"database error provoked via '{test.param}' — "
-                    "possible SQL injection, verify manually")
+            return "database error provoked — possible SQL injection"
     return None
