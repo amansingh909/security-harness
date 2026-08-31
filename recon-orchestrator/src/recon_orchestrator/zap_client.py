@@ -69,7 +69,16 @@ class ZapClient:
             if str(status) == "100":
                 return
             await asyncio.sleep(self._poll)
-        log.warning("ZAP scan did not finish within budget",
+
+        # Budget elapsed: tell ZAP to STOP so it does not keep scanning the
+        # target in the background after we have returned. Without this the
+        # daemon keeps spidering/attacking and the next scan queues behind it.
+        stop_action = action.rsplit("/", 1)[0] + "/stop"
+        try:
+            await self._get(stop_action, scanId=scan_id)
+        except ZapError:
+            pass
+        log.warning("ZAP scan hit the time budget — stopped it",
                     extra={"action": action, "url": url, "max_wait": max_wait})
 
     async def add_request_header(self, name: str, value: str) -> None:

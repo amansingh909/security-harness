@@ -62,6 +62,33 @@ ALERTS = [
 # --- client flow -------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_scan_stops_zap_when_budget_elapses():
+    """If a scan never reaches 100% within max_wait, ZAP is told to stop so it
+    does not keep scanning after we return."""
+    stopped: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p.endswith("/spider/action/scan/") or p.endswith("/ascan/action/scan/"):
+            return httpx.Response(200, json={"scan": "0"})
+        if p.endswith("/spider/view/status/") or p.endswith("/ascan/view/status/"):
+            return httpx.Response(200, json={"status": "40"})  # never finishes
+        if p.endswith("/spider/action/stop/") or p.endswith("/ascan/action/stop/"):
+            stopped.append(p)
+            return httpx.Response(200, json={"Result": "OK"})
+        if p.endswith("/core/view/alerts/"):
+            return httpx.Response(200, json={"alerts": []})
+        return httpx.Response(200, json={})
+
+    async with ZapClient("http://zap", "k",
+                         transport=httpx.MockTransport(handler), poll_interval=0) as z:
+        await z.scan("https://demo.local", max_wait=0.05)
+
+    assert any("spider/action/stop" in s for s in stopped)
+    assert any("ascan/action/stop" in s for s in stopped)
+
+
+@pytest.mark.asyncio
 async def test_scan_drives_spider_ascan_then_alerts():
     async with ZapClient("http://zap", "k", transport=_zap_transport(ALERTS),
                          poll_interval=0) as z:
