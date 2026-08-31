@@ -75,6 +75,16 @@ class HttpProber:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def send(self, request):
+        """Send an arbitrary request through the shared rate limiter.
+
+        Active testing needs to issue custom requests but must not bypass the
+        token bucket — the politeness guarantee applies to every request, not
+        just the passive probes.
+        """
+        await self._bucket.acquire()
+        return await self._client.send(request)
+
     async def probe(self, host: str) -> HostProbe:
         import httpx
 

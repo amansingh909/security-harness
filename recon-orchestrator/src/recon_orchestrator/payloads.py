@@ -1,62 +1,91 @@
-"""Payload definitions and request generator for active testing mode.
+"""Active test vectors and request builder — for AUTHORIZED, OWNER-CONTROLLED
+targets only.
 
-The module provides a small dictionary of common vulnerability test vectors and a helper
-`generate_requests` that builds a list of `httpx.Request` objects for each vector.
+This module is only reached when ``Settings.active_tests`` is explicitly True,
+and it exists to test assets you own (your own demo/staging projects). It sends
+crafted input, which is exactly what bug-bounty programs prohibit — never point
+it at a target you do not control.
+
+Design choices that keep detection honest and low-false-positive:
+
+* Reflection uses a **unique marker** (``_XSS_MARKER``), so a hit means *our
+  input* came back unencoded — not that the page happened to contain a
+  ``<script>`` of its own.
+* SQL injection is detected by **database error signatures** in the response,
+  not by "the request returned 200".
+* Blind SSRF and auth-bypass are deliberately **left out**: neither can be
+  confirmed from a single response without an out-of-band listener or a
+  baseline, so auto-asserting them would be a false positive. Test those by
+  hand.
+* No destructive payloads. The original ``{"action":"delete"}`` vector is gone.
 """
-
 from __future__ import annotations
 
-import json
-from typing import Iterable, List
+import urllib.parse
+from dataclasses import dataclass
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# Payload definitions – each key maps to a dictionary of parameter/value pairs.
-# Extend this mapping as needed; the values are deliberately simple and safe.
-# ---------------------------------------------------------------------------
-PAYLOADS: dict[str, dict[str, str]] = {
-    "idor": {"id": "1' OR '1'='1"},
-    "xss": {"q": "<script>alert(1)</script>"},
-    "ssrf": {"url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"},
-    "sqli": {"username": "' OR 1=1--"},
-    "auth_bypass": {"Authorization": "Bearer invalid-token"},
-    # Business‑logic example – can be overridden via a custom YAML/JSON file.
-    "biz_logic": {"action": "delete", "resource": "admin"},
-}
+# A token unlikely to occur naturally; if it comes back verbatim, our input was
+# reflected without encoding.
+_XSS_MARKER = "xsSprobe9f3a2b<>"
+
+# Substrings that indicate the backend leaked a database error.
+SQL_ERROR_SIGNATURES: tuple[str, ...] = (
+    "sql syntax", "mysql_fetch", "you have an error in your sql",
+    "unclosed quotation mark", "quoted string not properly terminated",
+    "sqlstate", "ora-0", "psql:", "pg_query", "sqlite error",
+    "odbc", "syntax error at or near",
+)
 
 
-def _build_url(base: str, params: dict[str, str]) -> str:
-    """Return a URL‑encoded query string appended to ``base``.
+@dataclass(frozen=True)
+class ActiveTest:
+    name: str
+    kind: str        # "reflection" | "sql_error"
+    param: str
+    value: str
 
-    ``base`` may already contain a query component – we simply concatenate with '&'.
+
+# The default set. Each vector is detectable from the response it provokes.
+TESTS: tuple[ActiveTest, ...] = (
+    ActiveTest("reflected-input", "reflection", "q", _XSS_MARKER),
+    ActiveTest("sql-error", "sql_error", "id", "'\"`)"),
+)
+
+
+def _with_query(base: str, param: str, value: str) -> str:
+    """Append ``param=value`` to ``base`` with correct URL encoding."""
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{param}={urllib.parse.quote(value)}"
+
+
+def build_requests(base_url: str) -> list[tuple[ActiveTest, httpx.Request]]:
+    """Build a (test, request) pair for each vector.
+
+    Injects into a query parameter with a GET — the request shape a reflected
+    or error-based issue on a page parameter would surface through. Returns the
+    test alongside the request so the caller knows how to interpret the
+    response.
     """
-    if not params:
-        return base
-    query = "&".join(f"{k}={httpx.utils.quote(v)}" for k, v in params.items())
-    connector = "&" if "?" in base else "?"
-    return f"{base}{connector}{query}"
+    out: list[tuple[ActiveTest, httpx.Request]] = []
+    for test in TESTS:
+        url = _with_query(base_url, test.param, test.value)
+        out.append((test, httpx.Request("GET", url)))
+    return out
 
 
-def generate_requests(base_url: str) -> List[httpx.Request]:
-    """Create a list of ``httpx.Request`` objects for each payload.
-
-    For each payload we issue a **POST** request with a JSON body containing the
-    payload dictionary. If the payload contains an ``Authorization`` header key,
-    we treat it specially and send a ``GET`` request with the header set.
-    """
-    requests: List[httpx.Request] = []
-    for name, data in PAYLOADS.items():
-        # Heuristic: if a payload looks like a header (e.g. "Authorization"),
-        # we send it as a GET with that header; otherwise we POST JSON.
-        if any(k.lower() in {"authorization", "auth", "basic", "bearer"} for k in data):
-            headers = {k: v for k, v in data.items()}
-            req = httpx.Request("GET", base_url, headers=headers)
-        else:
-            # POST with JSON body – also expose a query‑string version for GET‑only services.
-            req = httpx.Request("POST", base_url, json=data)
-            # Additionally, a GET version with the same params in the URL for services that only accept query strings.
-            get_req = httpx.Request("GET", _build_url(base_url, data))
-            requests.append(get_req)
-        requests.append(req)
-    return requests
+def interpret(test: ActiveTest, body: str) -> str | None:
+    """Return a signal string if the response indicates the test fired, else None."""
+    if not body:
+        return None
+    if test.kind == "reflection":
+        if test.value in body:
+            return (f"reflected input via '{test.param}' (unencoded) — "
+                    "possible XSS, verify manually")
+    elif test.kind == "sql_error":
+        low = body.lower()
+        if any(sig in low for sig in SQL_ERROR_SIGNATURES):
+            return (f"database error provoked via '{test.param}' — "
+                    "possible SQL injection, verify manually")
+    return None

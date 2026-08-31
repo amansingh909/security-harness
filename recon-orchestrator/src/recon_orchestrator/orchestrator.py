@@ -19,7 +19,6 @@ from .models import CandidateFinding, CveCandidate, HostProbe
 from .ratelimit import TokenBucket
 from .scope import ScopeGuard
 from .triage import triage
-from . import payloads
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +52,7 @@ class ReconOrchestrator:
     ) -> tuple[HostProbe, list[CveCandidate], list[str]]:
         async with self._sem:
             if self._shutdown.is_set():
-                return HostProbe(host=host, error="skipped: shutting down"), []
+                return HostProbe(host=host, error="skipped: shutting down"), [], []
             probe = await prober.probe(host)
             active_signals: list[str] = []
             if self._s.active_tests and not probe.error:
@@ -175,35 +174,31 @@ class ReconOrchestrator:
         return signals, score
 
     async def _run_active_tests(self, prober: HttpProber, host: str) -> list[str]:
-        """Execute active payload tests against ``host``.
+        """Send crafted-input tests against ``host`` — OWNED ASSETS ONLY.
 
-        Returns a list of textual signals describing any suspicious behaviour.
-        The implementation is deliberately lightweight – it sends the small set
-        of payloads defined in ``payloads.py`` using the same ``httpx.AsyncClient``
-        that ``HttpProber`` uses. Responses are inspected for simple indicators
-        such as reflected payload values, unexpected status codes, or presence
-        of authentication‑bypass headers.
+        Reached only when ``active_tests`` is set. Requests go through the
+        prober's rate limiter (no bypass), and detection is signature/marker
+        based so a signal means the response actually showed something, not
+        merely that a request returned 200.
         """
-        import httpx
         from . import payloads
 
+        # Loud, per-host record that active traffic was sent — this is the mode
+        # that must never touch a target you do not control.
+        log.warning("active tests enabled — sending crafted input to owned target",
+                    extra={"host": host})
+
         signals: list[str] = []
-        base = f"https://{host}"  # primary scheme – fallback to http on failure
-        reqs = payloads.generate_requests(base)
-        for req in reqs:
+        for test, req in payloads.build_requests(f"https://{host}"):
+            if self._shutdown.is_set():
+                break
             try:
-                resp = await prober._client.send(req)
-            except Exception as exc:  # noqa: BLE001
-                # network or protocol error – treat as silent fail
+                resp = await prober.send(req)
+            except Exception:  # noqa: BLE001 - network/protocol error, skip
                 continue
-            # Simple heuristics per payload name (derived from request URL or method)
-            name = req.url.path.strip('/') or req.method.lower()
-            # Reflected payload detection for GET/POST bodies
-            if resp.text and any(val in resp.text for val in req.headers.values()):
-                signals.append(f"{name}: reflected payload on {host}")
-            if resp.status_code and resp.status_code < 300:
-                # Successful response – could indicate acceptance of malicious input
-                signals.append(f"{name}: unexpected success ({resp.status_code}) on {host}")
+            signal = payloads.interpret(test, resp.text or "")
+            if signal:
+                signals.append(signal)
         return signals
 
     async def run(self, seeds: list[str], prober: HttpProber | None = None) -> list[CandidateFinding]:
@@ -257,13 +252,26 @@ class ReconOrchestrator:
         findings = triage(probes)
 
         # Merge CVE candidates and active-test signals into findings.
+        by_host = {f.host: f for f in findings}
         for finding in findings:
             finding.cve_candidates = cve_by_host.get(finding.host, [])
-            act = active_by_host.get(finding.host)
-            if act:
-                finding.signals.extend(act)
-                # modest priority boost per active signal
-                finding.priority_score += len(act) * 2
+
+        # Active-test hits are near-confirmed vuln indicators (reflected input,
+        # DB errors), so they score high. Attach to the host's finding, or
+        # create one — an active hit on an otherwise-boring host that triage
+        # dropped must still surface.
+        for host, act in active_by_host.items():
+            existing = by_host.get(host)
+            if existing is not None:
+                existing.signals.extend(act)
+                existing.priority_score += len(act) * 5
+            else:
+                new = CandidateFinding(
+                    host=host, url=f"https://{host}",
+                    priority_score=len(act) * 5, signals=list(act),
+                )
+                findings.append(new)
+                by_host[host] = new
 
         # Stage 3: GET-only sensitive-path checks, folded into findings.
         if self._s.enable_sensitive_checks and not self._shutdown.is_set():
