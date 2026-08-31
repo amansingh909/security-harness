@@ -161,6 +161,61 @@ def _cmd_import_scope(args: argparse.Namespace) -> None:
     reg.save(programs_file())
 
 
+def _cmd_preview(args: argparse.Namespace) -> None:
+    """Set up an active-testing program pointed at a Vercel PREVIEW deployment.
+
+    Pass a preview URL directly, or a project name (resolved via VERCEL_TOKEN).
+    The program is scoped to that one exact host and armed with active_tests +
+    ZAP — so you attack the preview, never prod.
+    """
+    from .vercel import host_from_url, latest_preview_host
+
+    host = host_from_url(args.target)
+    if host is None:
+        # Not a URL — treat as a Vercel project name and resolve via the API.
+        token = os.getenv("VERCEL_TOKEN")
+        if not token:
+            raise SystemExit(
+                f"'{args.target}' is not a URL and no VERCEL_TOKEN is set.\n"
+                "  Paste a preview URL, or add VERCEL_TOKEN to ~/.harness/.env\n"
+                "  (create one at vercel.com/account/tokens)."
+            )
+        try:
+            host = asyncio.run(latest_preview_host(args.target, token))
+        except (PermissionError, LookupError, RuntimeError) as exc:
+            raise SystemExit(str(exc))
+
+    if host.endswith((".prod.vercel.app",)) or host in ("vercel.app",):
+        raise SystemExit(f"refusing: {host!r} does not look like a preview host")
+
+    name = args.program or (host.split(".")[0] + "-preview")
+    ensure_dirs()
+    reg = Registry.load(programs_file())
+    existing = reg.get(name)
+    fields = {
+        "in_scope": [host],
+        "out_of_scope": [],
+        "seeds": [host],
+        "active_tests": True,
+        "use_zap": args.zap,
+    }
+    if existing is None:
+        reg.add(Program(name=name, seeds_file=None,
+                        cve_index_url=args.cve_index_url, **fields))
+        verb = "created"
+    else:
+        reg.add(existing.model_copy(update=fields))
+        verb = "updated"
+    reg.save(programs_file())
+
+    engine = "ZAP" if args.zap else "built-in"
+    print(f"{verb} program {name!r} -> {host}")
+    print(f"  scope: {host} (exact host only)   active testing: {engine}")
+    print(f"  run it:  harness hunt {name}     or press 'r' on {name!r} in the TUI")
+    print("  NOTE: preview deployments with Vercel auth protection must have it "
+          "disabled (or a bypass) for the scan to reach them.")
+
+
 def _cmd_up(args: argparse.Namespace) -> None:
     """Start Elasticsearch and cve‑index services and verify health."""
     # Run the async helper that starts services and waits for health
@@ -532,6 +587,17 @@ def main() -> None:
     p_scope.add_argument("--cve-index-url", dest="cve_index_url",
                          default="http://localhost:8080")
     p_scope.set_defaults(func=_cmd_import_scope)
+
+    # ── Vercel preview target (active testing, owned assets) ──────────────────
+    p_prev = sub.add_parser(
+        "preview",
+        help="arm active testing against a Vercel PREVIEW deployment (not prod)",
+    )
+    p_prev.add_argument("target", help="a preview URL, or a Vercel project name (needs VERCEL_TOKEN)")
+    p_prev.add_argument("--program", help="local program name (default: <host>-preview)")
+    p_prev.add_argument("--zap", action="store_true", help="use the ZAP engine (default: built-in tester)")
+    p_prev.add_argument("--cve-index-url", dest="cve_index_url", default="http://localhost:8080")
+    p_prev.set_defaults(func=_cmd_preview)
 
     # ── Service helpers ───────────────────────────────────────────────────────
     sub.add_parser("up", help="start Elasticsearch and cve‑index services and verify health").set_defaults(func=_cmd_up)
