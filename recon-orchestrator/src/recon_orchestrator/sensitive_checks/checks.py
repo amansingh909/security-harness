@@ -14,40 +14,46 @@ import httpx
 from ..config import Settings
 from ..models import HostProbe
 
-# Common sensitive paths that often leak information
-_SENSITIVE_PATHS: List[str] = [
-    "/.git/",
-    "/.git/HEAD",
-    "/.git/config",
-    "/.env",
-    "/.htaccess",
-    "/.htpasswd",
-    "/web.config",
-    "/phpinfo.php",
-    "/info.php",
-    "/server-status",
-    "/server-info",
-    "/wp-config.php",
-    "/configuration.php",
-    "/config.php",
-    "/admin/",
-    "/administrator/",
-    "/login.php",
-    "/phpmyadmin/",
-    "/test/",
-    "/backup/",
-    "/backups/",
-    "/dump/",
-    "/sql/",
-    "/database.sql",
-    "/backup.sql",
-    "/robots.txt",  # While not sensitive itself, it reveals interesting paths
-    "/.well-known/",
-    "/.well-known/security.txt",
-    "/.well-known/acme-challenge/",
-    "/crossdomain.xml",
-    "/clientaccesspolicy.xml",
-]
+def _looks_like_dotenv(body: str) -> bool:
+    lines = [ln for ln in body.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        return False
+    keyval = sum(1 for ln in lines if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", ln.strip()))
+    return keyval >= max(1, len(lines) // 2)
+
+
+def _looks_like_sql_dump(body: str) -> bool:
+    low = body.lower()
+    return "insert into" in low or "create table" in low or "-- mysql dump" in low
+
+
+def _looks_like_htpasswd(body: str) -> bool:
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    return bool(lines) and all(re.match(r"^[^:\s]+:\S+$", ln.strip()) for ln in lines)
+
+
+# Path -> predicate that confirms the RESPONSE BODY really is that secret file.
+# A 200 alone is not enough: single-page apps and catch-all routers return
+# 200 index.html for any path, so an unverified 200 is a false positive. Every
+# entry here checks content, so a match is high-confidence information
+# disclosure rather than "this path returned something".
+_SECRET_SIGNATURES: dict[str, "callable"] = {
+    "/.git/config": lambda b: "[core]" in b or "repositoryformatversion" in b.lower(),
+    "/.git/HEAD": lambda b: b.strip().startswith("ref:") or re.fullmatch(r"[0-9a-f]{40}", b.strip()) is not None,
+    "/.env": _looks_like_dotenv,
+    "/.htpasswd": _looks_like_htpasswd,
+    "/wp-config.php": lambda b: "<?php" in b and ("DB_PASSWORD" in b or "define(" in b),
+    "/config.php": lambda b: "<?php" in b,
+    "/configuration.php": lambda b: "<?php" in b,
+    "/phpinfo.php": lambda b: "phpinfo()" in b.lower() or "php version" in b.lower(),
+    "/info.php": lambda b: "phpinfo()" in b.lower() or "php version" in b.lower(),
+    "/server-status": lambda b: "server status" in b.lower() and "apache" in b.lower(),
+    "/server-info": lambda b: "server information" in b.lower() and "apache" in b.lower(),
+    "/database.sql": _looks_like_sql_dump,
+    "/backup.sql": _looks_like_sql_dump,
+    "/web.config": lambda b: "<configuration" in b.lower(),
+}
+_SENSITIVE_PATHS: List[str] = list(_SECRET_SIGNATURES)
 
 # Security headers that should be present for good security
 _SECURITY_HEADERS: dict[str, str] = {
@@ -95,45 +101,46 @@ async def check_sensitive_paths(
         )
         timeout = httpx.Timeout(settings.http_timeout, connect=settings.connect_timeout)
 
+        # follow_redirects=False is essential: a redirect to a login page is
+        # the server saying the file is NOT there. Following it turns every
+        # path into a false "exposed" hit on the login page.
         async with httpx.AsyncClient(
             headers={"User-Agent": settings.user_agent},
             timeout=timeout,
             limits=limits,
             verify=settings.verify_tls,
-            follow_redirects=True,
+            follow_redirects=False,
         ) as client:
             for path in _SENSITIVE_PATHS:
                 url = f"{base_url}{path}"
                 try:
                     resp = await client.get(url)
-                    # Only consider it a finding if we get a successful response
-                    # (2xx, 3xx, or sometimes 401/403 which indicates the resource exists)
-                    if resp.status_code < 500:  # Not a server error
-                        headers = {k: v for k, v in resp.headers.items()}
-                        # Extract title if HTML and small
-                        title: str | None = None
-                        if resp.text and len(resp.text) < 10000 and resp.headers.get("content-type", "").startswith("text/html"):
-                            import re
-                            match = re.search(r"<title[^>]*>([^<]+)</title>", resp.text, re.IGNORECASE)
-                            if match:
-                                title = match.group(1).strip()
-
-                        findings.append(HostProbe(
-                            host=host,
-                            url=str(resp.url),
-                            status=resp.status_code,
-                            title=title,
-                            server=headers.get("server") or headers.get("Server"),
-                            port=port,
-                            headers=headers,
-                            fingerprints=[],  # We don't do full fingerprinting here
-                        ))
                 except (httpx.TransportError, httpx.HTTPError):
-                    # Connection errors, timeouts, etc. - just skip this path
                     continue
                 except Exception:
-                    # Any other unexpected error - skip this path
                     continue
+
+                # Must be a real 200 that actually served the file...
+                if resp.status_code != 200:
+                    continue
+                body = resp.text or ""
+                validator = _SECRET_SIGNATURES.get(path)
+                # ...and the body must look like the secret, not an SPA's
+                # index.html returned for every route.
+                if validator is None or not validator(body):
+                    continue
+
+                headers = {k: v for k, v in resp.headers.items()}
+                findings.append(HostProbe(
+                    host=host,
+                    url=str(resp.url),
+                    status=resp.status_code,
+                    title=path,  # the path that leaked, used downstream as the signal
+                    server=headers.get("server") or headers.get("Server"),
+                    port=port,
+                    headers=headers,
+                    fingerprints=[],
+                ))
 
     return findings
 

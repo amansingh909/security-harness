@@ -56,6 +56,18 @@ Screen {
     padding-bottom: 1;
 }
 
+.form-section {
+    text-style: bold;
+    color: $text-muted;
+}
+
+.form-divider {
+    color: $text-muted;
+    text-align: center;
+    width: 100%;
+    padding: 1 0 0 0;
+}
+
 #dialog-buttons {
     height: auto;
     padding-top: 1;
@@ -66,6 +78,24 @@ Screen {
     margin-left: 2;
 }
 
-AddProgramScreen, PromptScreen {
+AddProgramScreen, PromptScreen, ConfirmScreen, HelpScreen {
     align: center middle;
+}
+
+/* dim the screen behind a modal so the dialog reads as on top */
+ConfirmScreen, HelpScreen {
+    background: $background 60%;
+}
+
+#help-dialog {
+    width: 66;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: thick $primary;
+}
+
+#help-body {
+    height: auto;
 }

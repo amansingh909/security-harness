@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     user_agent: str = "recon-orchestrator/0.1 (authorized security testing)"
     verify_tls: bool = True
 
+    # --- recon depth -----------------------------------------------------
+    # Discovery + enrichment stages. Subdomain enum (passive, crt.sh) and
+    # sensitive-path checks (GET-only) are on by default. Port sweep probes
+    # extra ports and is louder, so it is opt-in — strict programs forbid
+    # high-volume enumeration.
+    enable_subdomain_enum: bool = True
+    enable_sensitive_checks: bool = True
+    enable_port_sweep: bool = False
+
     # --- CVE correlation (optional) --------------------------------------
     cve_index_url: str | None = None     # e.g. http://localhost:8080
 

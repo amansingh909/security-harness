@@ -22,7 +22,10 @@ class FakeProber:
 
 @pytest.mark.asyncio
 async def test_pipeline_gates_scope_and_triages():
-    settings = Settings(requests_per_second=100, cve_index_url=None)
+    # Isolate the core probe+triage path; discovery and sensitive checks make
+    # real network calls and have their own tests.
+    settings = Settings(requests_per_second=100, cve_index_url=None,
+                        enable_subdomain_enum=False, enable_sensitive_checks=False)
     scope = ScopeGuard(in_scope=["*.example.com"], out_of_scope=["admin.example.com"])
     orch = ReconOrchestrator(settings, scope)
 

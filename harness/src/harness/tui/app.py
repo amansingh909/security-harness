@@ -3,7 +3,6 @@ scaffold + render a report, classify CVEs — all menu/key driven."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -19,6 +18,9 @@ from textual.widgets import (
     Label,
     Static,
 )
+import os
+
+from rich.text import Text
 
 from .. import engine, store
 from ..findings import finding_template
@@ -26,6 +28,27 @@ from ..paths import ensure_dirs, hunts_dir, programs_file
 from ..programs import Program, Registry
 
 DEFAULT_CVE_URL = "http://localhost:8080"
+
+
+def _score_cell(score) -> Text:
+    """Colour a priority score so high-value leads catch the eye in a table.
+
+    A ranked list is only useful if the top of it stands out; a plain number
+    makes a 95 look the same as a 10.
+    """
+    try:
+        value = int(score)
+    except (TypeError, ValueError):
+        return Text(str(score or "-"), style="dim")
+    if value >= 70:
+        style = "bold red"
+    elif value >= 40:
+        style = "bold yellow"
+    elif value >= 15:
+        style = "green"
+    else:
+        style = "dim"
+    return Text(str(value), style=style)
 
 
 class AddProgramScreen(ModalScreen[dict | None]):
@@ -36,12 +59,14 @@ class AddProgramScreen(ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("Add program", id="dialog-title")
+            yield Label("Import scope from HackerOne:", classes="form-section")
+            yield Input(placeholder="program handle (e.g. security) — pulls scope for you",
+                       id="f-handle")
+            yield Label("— or enter it manually —", classes="form-divider")
             yield Input(placeholder="name (e.g. acme)", id="f-name")
             yield Input(placeholder="in-scope, comma sep (e.g. *.acme.com)", id="f-in")
             yield Input(placeholder="out-of-scope, comma sep (optional)", id="f-out")
             yield Input(placeholder="seeds, comma sep (optional)", id="f-seeds")
-            yield Input(placeholder="seeds file path (optional)", id="f-seedsfile")
-            yield Input(placeholder="cve-index url (e.g. http://localhost:8080)", id="f-cve")
             with Horizontal(id="dialog-buttons"):
                 yield Button("Save", variant="primary", id="save")
                 yield Button("Cancel", id="cancel")
@@ -50,9 +75,18 @@ class AddProgramScreen(ModalScreen[dict | None]):
         if event.button.id == "cancel":
             self.dismiss(None)
             return
+
+        # A handle takes the import path; the manual fields are ignored so the
+        # two ways of adding a program never fight over the same submit.
+        handle = self.query_one("#f-handle", Input).value.strip()
+        if handle:
+            self.dismiss({"import_handle": handle})
+            return
+
         name = self.query_one("#f-name", Input).value.strip()
         if not name:
-            self.app.notify("name is required", severity="error")
+            self.app.notify("enter a HackerOne handle to import, or a name to add manually",
+                           severity="error")
             return
 
         def split(box_id: str) -> list[str]:
@@ -64,8 +98,10 @@ class AddProgramScreen(ModalScreen[dict | None]):
             "in_scope": split("#f-in"),
             "out_of_scope": split("#f-out"),
             "seeds": split("#f-seeds"),
-            "seeds_file": self.query_one("#f-seedsfile", Input).value.strip() or None,
-            "cve_index_url": self.query_one("#f-cve", Input).value.strip() or None,
+            # Sensible defaults — the local cve-index, no seeds file. Both are
+            # rarely changed and stay editable in programs.yaml for the odd case.
+            "seeds_file": None,
+            "cve_index_url": DEFAULT_CVE_URL,
         })
 
     def action_cancel(self) -> None:
@@ -75,11 +111,118 @@ class AddProgramScreen(ModalScreen[dict | None]):
 class PromptScreen(ModalScreen[str | None]):
     """Generic single-line prompt modal (used for CVE search and classify)."""
 
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, placeholder: str) -> None:
+        super().__init__()
+        self._title = title
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._title, id="dialog-title")
+            yield Input(placeholder=self._placeholder, id="q")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Go", variant="primary", id="go")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        else:
+            self.dismiss(self.query_one("#q", Input).value.strip() or None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no modal. Defaults to No so a stray Enter never confirms."""
+
+    BINDINGS = [
+        Binding("escape", "no", "Cancel"),
+        Binding("n", "no", "No"),
+        Binding("y", "yes", "Yes"),
+    ]
+
+    def __init__(self, question: str, confirm_label: str = "Confirm",
+                 destructive: bool = True) -> None:
+        super().__init__()
+        self._question = question
+        self._confirm_label = confirm_label
+        self._destructive = destructive
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._question, id="dialog-title")
+            with Horizontal(id="dialog-buttons"):
+                yield Button(
+                    self._confirm_label,
+                    variant="error" if self._destructive else "primary",
+                    id="yes",
+                )
+                yield Button("Cancel", id="no")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+class HelpScreen(ModalScreen[None]):
+    """Keybinding reference and the recon → report workflow."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("q", "close", "Close"),
+        Binding("question_mark", "close", "Close"),
+    ]
+
+    HELP = """[b]security-harness[/b]
+
+[b]Workflow[/b]
+  1. [b]a[/b] add a program — manually, or import its scope from HackerOne
+  2. [b]r[/b] recon — probe hosts, collect ranked leads
+  3. [b]v[/b] scan — correlate services against the CVE index
+  4. [b]t[/b] triage — ranked findings across every program
+  5. [b]w[/b] scaffold → fill in → [b]e[/b] render a report
+  6. [b]u[/b] upload the report to HackerOne / Bugcrowd
+
+[b]Programs[/b]              [b]Per lead[/b]
+  a  add / import H1      s  search the CVE index
+  i  import H1 scope      c  classify a description
+  d  delete (confirms)    w  scaffold a report
+  n  nightly: all progs   e  render a report
+
+[b]Anywhere[/b]
+  t  triage      u  upload      q  quit      ?  this help
+
+[dim]Only run recon/scan against programs whose policy allows
+automated scanning.[/dim]"""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-dialog"):
+            yield Static(self.HELP, id="help-body")
+            yield Label("[dim]esc / q / ? to close[/dim]")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
 
 class TriageScreen(ModalScreen[None]):
     """Screen showing a ranked table of vulnerability findings across all programs."""
 
-    BINDINGS = [Binding("escape", "cancel", "Close")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("q", "cancel", "Close"),   # also allow q to close the modal
+    ]
 
     def __init__(self, registry: Registry) -> None:
         super().__init__()
@@ -115,12 +258,17 @@ class TriageScreen(ModalScreen[None]):
                 service_desc = f"{scheme.upper()} {service_info.get('server','')} {service_info.get('powered_by','')}".strip()
                 cves = v.get("cves", [])
                 cve_count = len(cves)
-                exploit_flag = "✓" if any(c.get("exploit_available") for c in cves) else ""
+                has_exploit = any(c.get("exploit_available") for c in cves)
+                exploit_flag = Text("✓ EXPLOIT", style="bold red") if has_exploit else Text("")
                 # Sensitive flag: check if we stored extra fields (we will add later)
-                sensitive_flag = "✓" if v.get("sensitive_paths") or v.get("cookies") or v.get("cors_issues") else ""
+                sensitive_flag = (
+                    Text("✓", style="bold yellow")
+                    if v.get("sensitive_paths") or v.get("cookies") or v.get("cors_issues")
+                    else Text("")
+                )
                 table.add_row(
                     prog_name,
-                    str(score),
+                    _score_cell(score),
                     hostport,
                     service_desc,
                     str(cve_count),
@@ -129,34 +277,6 @@ class TriageScreen(ModalScreen[None]):
                     key=f"{prog_name}_{hostport}"
                 )
 
-
-def main() -> None:
-    HarnessApp().run()
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(self, title: str, placeholder: str) -> None:
-        super().__init__()
-        self._title = title
-        self._placeholder = placeholder
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
-            yield Label(self._title, id="dialog-title")
-            yield Input(placeholder=self._placeholder, id="q")
-            with Horizontal(id="dialog-buttons"):
-                yield Button("Go", variant="primary", id="go")
-                yield Button("Cancel", id="cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "cancel":
-            self.dismiss(None)
-        else:
-            self.dismiss(self.query_one("#q", Input).value.strip() or None)
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip() or None)
-
     def action_cancel(self) -> None:
         self.dismiss(None)
 
@@ -164,19 +284,25 @@ def main() -> None:
 class HarnessApp(App[None]):
     CSS_PATH = "app.tcss"
     TITLE = "security-harness"
+    # The footer only has room for the hot path — the rest are hidden
+    # (show=False) but still work, and `?` lists every one. This keeps the
+    # footer on one line instead of running off the edge of the terminal.
     BINDINGS = [
-        Binding("n", "nightly", "Nightly Run"),
-        Binding("t", "triage", "Triage"),
         Binding("r", "recon", "Recon"),
-        Binding("v", "scan", "Scan Vulns"),
-        Binding("s", "search", "Search CVEs"),
-        Binding("w", "report", "Scaffold report"),
-        Binding("e", "export", "Render report"),
-        Binding("c", "classify", "Classify"),
-        Binding("a", "add", "Add program"),
-        Binding("d", "delete", "Delete program"),
-        Binding("u", "upload", "Upload Report"),
+        Binding("v", "scan", "Scan"),
+        Binding("t", "triage", "Triage"),
+        Binding("u", "upload", "Upload"),
+        Binding("a", "add", "Add"),
+        Binding("question_mark", "help", "Help", key_display="?"),
         Binding("q", "quit", "Quit"),
+        # hidden from the footer, discoverable via `?`
+        Binding("i", "import_scope", "Import H1 scope", show=False),
+        Binding("n", "nightly", "Nightly run", show=False),
+        Binding("s", "search", "Search CVEs", show=False),
+        Binding("w", "report", "Scaffold report", show=False),
+        Binding("e", "export", "Render report", show=False),
+        Binding("c", "classify", "Classify", show=False),
+        Binding("d", "delete", "Delete program", show=False),
     ]
 
     def __init__(self) -> None:
@@ -208,6 +334,12 @@ class HarnessApp(App[None]):
         leads.add_columns("Score", "Host", "Why", "CVEs")
         self.refresh_programs()
         self.refresh_status()
+        # Auto-open triage if requested via environment variable (set by harness global).
+        # pop() so a second app run in the same process doesn't re-trigger it, and
+        # defer the push until after the first refresh — pushing a screen mid-mount
+        # leaves the modal on top while focus stays on the main screen.
+        if os.environ.pop("HARNESS_AUTO_OPEN_TRIAGE", None) == "1":
+            self.call_after_refresh(lambda: self.push_screen(TriageScreen(self.registry)))
 
     # ---- component status bar -----------------------------------------
     def _cve_url(self) -> str:
@@ -260,10 +392,10 @@ class HarnessApp(App[None]):
             cves = len(lead.get("cve_candidates", []))
             why = "; ".join(lead.get("signals", []))[:60] or "-"
             table.add_row(
-                str(lead.get("priority_score", "")),
+                _score_cell(lead.get("priority_score")),
                 lead.get("host", ""),
                 why,
-                str(cves) if cves else "-",
+                Text(str(cves), style="bold cyan") if cves else Text("-", style="dim"),
                 key=str(i),
             )
         title = self.current_program or "-"
@@ -308,6 +440,10 @@ class HarnessApp(App[None]):
         def handle(result: dict | None) -> None:
             if not result:
                 return
+            # A HackerOne handle routes to the import flow instead of a manual add.
+            if "import_handle" in result:
+                self._do_import_scope(result["import_handle"])
+                return
             self.registry.add(Program(**result))
             self.registry.save(programs_file())
             self.current_program = result["name"]
@@ -316,6 +452,83 @@ class HarnessApp(App[None]):
             self.notify(f"added program '{result['name']}'")
 
         self.push_screen(AddProgramScreen(), handle)
+
+    def action_import_scope(self) -> None:
+        """Prompt for a HackerOne handle and import its scope into the registry.
+
+        Saves running `harness import-scope` outside the TUI. Remember the
+        pipeline scans everything in the registry, so only add a program here
+        if it permits automated scanning — check its policy first.
+        """
+        def handle(result: str | None) -> None:
+            if result:
+                self._do_import_scope(result.strip())
+
+        self.push_screen(
+            PromptScreen("Import HackerOne scope", "program handle, e.g. security"),
+            handle,
+        )
+
+    @work(exclusive=True)
+    async def _do_import_scope(self, program_handle: str) -> None:
+        try:
+            from recon_orchestrator.hackerone_scope import fetch_structured_scopes
+        except ImportError:
+            self.notify("recon-orchestrator not installed", severity="error")
+            return
+
+        identifier = os.environ.get("H1_IDENTIFIER")
+        token = os.environ.get("H1_API_KEY")
+        if not identifier or not token:
+            self.notify(
+                "set H1_IDENTIFIER and H1_API_KEY in ~/.harness/.env first",
+                severity="error",
+            )
+            return
+
+        self.notify(f"fetching scope for '{program_handle}'…")
+        skipped: list[str] = []
+        try:
+            in_scope, out_scope = await fetch_structured_scopes(
+                program_handle, identifier, token, skipped=skipped
+            )
+        except (PermissionError, LookupError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"import failed: {exc}", severity="error")
+            return
+
+        if not in_scope and not out_scope:
+            self.notify(f"no host-shaped assets in '{program_handle}'", severity="warning")
+            return
+
+        existing = self.registry.get(program_handle)
+        if existing is None:
+            seeds = [p for p in in_scope if not p.startswith("*")]
+            self.registry.add(Program(
+                name=program_handle, in_scope=in_scope, out_of_scope=out_scope,
+                seeds=seeds, seeds_file=None, cve_index_url=DEFAULT_CVE_URL,
+            ))
+            verb = f"created with {len(seeds)} seed(s)"
+        else:
+            self.registry.add(existing.model_copy(update={
+                "in_scope": in_scope, "out_of_scope": out_scope,
+            }))
+            verb = "scope refreshed (seeds kept)"
+
+        self.registry.save(programs_file())
+        self.current_program = program_handle
+        self.refresh_programs()
+        self.select_program(program_handle)
+
+        extra = f" — {len(skipped)} non-host asset(s), review by hand" if skipped else ""
+        self.notify(
+            f"'{program_handle}': {len(in_scope)} in, {len(out_scope)} out, {verb}{extra}. "
+            f"Check the program's automation policy before scanning.",
+            severity="information",
+            timeout=10,
+        )
 
     def action_nightly(self) -> None:
         """Run the nightly pipeline for all programs (sub‑domain enum → port sweep → CPE → etc.)."""
@@ -328,19 +541,40 @@ class HarnessApp(App[None]):
 
     @work(exclusive=True)
     async def _run_nightly_all(self) -> None:
-        """Worker that runs the nightly orchestrator once and updates UI."""
-        try:
-            # Import here to avoid circular import issues
-            from ..recon_orchestrator.nightly.orchestrator import run_all_once
-            run_all_once()  # this function runs synchronously (asyncio.run inside)
-            # After run, refresh data for the currently selected program (if any)
-            if self.current_program:
-                self.current_leads = store.load_leads(self.current_program)
-                self.refresh_leads()
-                self.refresh_programs()
-            self.notify("nightly run completed", severity="information")
-        except Exception as exc:  # noqa: BLE001
-            self.notify(f"nightly run failed: {exc}", severity="error")
+        """Run recon + vuln scan for every program, then refresh the UI.
+
+        This drives the same engine pipeline as `harness global`, so results
+        land in the harness store and the tables update. The nightly package's
+        own runner keeps its results internally and would leave these views
+        showing stale data.
+        """
+        names = self.registry.names()
+        if not names:
+            self.notify("no programs configured", severity="warning")
+            return
+
+        ran = failed = 0
+        for i, name in enumerate(names, 1):
+            program = self.registry.get(name)
+            self.notify(f"[{i}/{len(names)}] {name}: recon…")
+            try:
+                leads = await engine.run_recon(program)
+                store.save_leads(name, leads)
+                vulns = await engine.scan_for_vulns(program, leads)
+                store.save_vulns(name, vulns)
+                ran += 1
+            except Exception as exc:  # noqa: BLE001 - one program must not sink the run
+                failed += 1
+                self.notify(f"{name}: {exc}", severity="error")
+
+        if self.current_program:
+            self.current_leads = store.load_leads(self.current_program)
+            self.refresh_leads()
+        self.refresh_programs()
+        self.notify(
+            f"nightly run finished: {ran} ok, {failed} failed",
+            severity="error" if failed else "information",
+        )
 
     def action_triage(self) -> None:
         """Open the triage dashboard showing ranked findings across all programs."""
@@ -350,25 +584,46 @@ class HarnessApp(App[None]):
         self.push_screen(TriageScreen(self.registry))
 
     def action_upload(self) -> None:
-        """Generate a batch report and upload it to configured platforms."""
+        """Generate a batch report and upload it to configured platforms.
+
+        Keys come from ~/.harness/.env (H1_API_KEY / BC_API_KEY), so the token
+        is never typed on screen. Uploading submits real reports to a real
+        program, so it always confirms first.
+        """
         if not self.current_program:
             self.notify("no program selected", severity="warning")
             return
-        # Ensure we have leads (run recon if needed)
-        if not self.current_leads:
-            self.notify("no leads available – run recon first (press 'r')", severity="warning")
+        vulns = store.load_vulns(self.current_program)
+        if not vulns:
+            self.notify("no findings to upload — run scan first (press 'v')",
+                       severity="warning")
             return
-        # Prompt for API keys once per session
-        def handle_keys(result: dict | None) -> None:
-            if not result:
-                return
-            h1_key = result.get("h1_key")
-            bc_key = result.get("bc_key")
-            self._do_upload(h1_key, bc_key)
-        self.push_screen(PromptScreen(
-            "Enter API keys (leave blank to skip that platform)",
-            "HackerOne API key,Bugcrowd API key (comma separated)"
-        ), handle_keys)
+
+        h1_key = os.environ.get("H1_API_KEY")
+        bc_key = os.environ.get("BC_API_KEY")
+        if not h1_key and not bc_key:
+            self.notify(
+                "no API keys — set H1_API_KEY / BC_API_KEY in ~/.harness/.env",
+                severity="error",
+            )
+            return
+
+        targets = ", ".join(
+            n for n, k in (("HackerOne", h1_key), ("Bugcrowd", bc_key)) if k
+        )
+
+        def confirmed(ok: bool | None) -> None:
+            if ok:
+                self._do_upload(h1_key, bc_key)
+
+        self.push_screen(
+            ConfirmScreen(
+                f"Submit {len(vulns)} finding(s) for "
+                f"'{self.current_program}' to {targets}?",
+                confirm_label="Submit",
+            ),
+            confirmed,
+        )
 
     def _do_upload(self, h1_key: str | None, bc_key: str | None) -> None:
         """Internal: generate report and call uploader."""
@@ -381,29 +636,70 @@ class HarnessApp(App[None]):
                 return
             # Generate report
             from ..engine import render_batch_report
-            from pathlib import Path
             out_dir = hunts_dir() / self.current_program
             report_path = render_batch_report(self.current_program, vulns, out_dir)
             self.notify(f"report generated: {report_path}")
-            # Upload
-            from ..bounty_reporter.uploader import upload_report
-            # Try both platforms; errors are caught inside uploader
-            upload_report(report_path, self.current_program, h1_key, bc_key)
-            self.notify("upload completed (check console for details)", severity="information")
+            # Upload. bounty_reporter is a sibling top-level package, not a
+            # submodule of harness — a relative import does not resolve.
+            from bounty_reporter.uploader import upload_report
+            # render_batch_report returns the Markdown path; upload_report parses
+            # JSON. Both are written side by side in out_dir.
+            res = upload_report(
+                report_path.with_suffix(".json"), self.current_program, h1_key, bc_key
+            )
+            # Report what actually happened rather than assuming success.
+            sent = sum(p["sent"] for p in res.values())
+            failed = sum(p["failed"] for p in res.values())
+            errors = [e for p in res.values() for e in p["errors"]]
+            if failed or errors:
+                detail = errors[0] if errors else "see console"
+                self.notify(
+                    f"upload: {sent} sent, {failed} failed — {detail}",
+                    severity="error",
+                )
+            else:
+                self.notify(f"upload completed: {sent} sent", severity="information")
         except Exception as exc:  # noqa: BLE001
             self.notify(f"upload failed: {exc}", severity="error")
 
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
+
     def action_delete(self) -> None:
         if not self.current_program:
+            self.notify("no program selected", severity="warning")
             return
         name = self.current_program
-        if self.registry.remove(name):
-            self.registry.save(programs_file())
-            self.current_program = None
-            self.current_leads = []
-            self.refresh_programs()
-            self.refresh_leads()
-            self.notify(f"deleted program '{name}'", severity="warning")
+
+        def confirmed(ok: bool | None) -> None:
+            if not ok:
+                return
+            if self.registry.remove(name):
+                self.registry.save(programs_file())
+                self.current_program = None
+                self.current_leads = []
+                self.refresh_programs()
+                self.refresh_leads()
+                self.notify(f"deleted program '{name}'", severity="warning")
+
+        self.push_screen(
+            ConfirmScreen(f"Delete program '{name}'? This cannot be undone.",
+                         confirm_label="Delete"),
+            confirmed,
+        )
+
+    def action_recon(self) -> None:
+        """Handler for the `r` binding. The worker existed but nothing called
+        it, so the key advertised in the footer did nothing at all."""
+        if not self.current_program:
+            self.notify("no program selected", severity="warning")
+            return
+        program = self.registry.get(self.current_program)
+        runnable, why = program.is_runnable()
+        if not runnable:
+            self.notify(f"can't run: {why}", severity="error")
+            return
+        self._run_recon(program)
 
     def action_scan(self) -> None:
         if not self.current_program:
@@ -449,16 +745,22 @@ class HarnessApp(App[None]):
             self.current_leads = leads
             self.refresh_leads()
 
-            # Run vuln scan
+            # Run vuln scan and persist it — without this the findings vanish
+            # and Triage (which reads from storage) has nothing to show.
             vulns = await engine.scan_for_vulns(program, leads)
+            store.save_vulns(program.name, vulns)
+            self.refresh_programs()
 
-            # Update view
             if vulns:
-                msg = f"[b]scan done[/b] — found {len(vulns)} potential vulnerabilities."
-                self.notify(f"found {len(vulns)} potential vulnerabilities", severity="information")
+                msg = (f"[b]scan done[/b] — {len(vulns)} finding(s). "
+                       "Press [b]t[/b] to open Triage.")
+                self.notify(
+                    f"found {len(vulns)} finding(s) — press 't' for triage",
+                    severity="information",
+                )
             else:
-                msg = "[b]scan done[/b] — no vulnerabilities identified."
-                self.notify("scan complete: no vulnerabilities identified", severity="information")
+                msg = "[b]scan done[/b] — no findings."
+                self.notify("scan complete: no findings", severity="information")
             self.query_one("#detail", Static).update(msg)
         except engine.ComponentMissing as exc:
             self.notify(str(exc), severity="error")

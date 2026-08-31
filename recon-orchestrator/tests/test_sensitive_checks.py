@@ -102,122 +102,75 @@ def test_check_cookie_flags():
 
 
 @pytest.mark.asyncio
-async def test_check_sensitive_paths_mocked():
-    """Test sensitive path checking with mocked responses."""
-    settings = Settings(
-        requests_per_second=2.0,
-        max_concurrency=10,
-        http_timeout=15.0,
-        connect_timeout=5.0,
-        max_retries=3,
-        backoff_base=1.0,
-        backoff_max=30.0,
-        user_agent="test-agent/1.0",
-        verify_tls=True,
-        cve_index_url=None,
-    )
+def _mock_client_returning(by_path):
+    """Build a mocked httpx.AsyncClient whose GET returns (status, body) chosen
+    by matching a substring of the requested path. follow_redirects is off, so
+    the checker sees raw statuses."""
+    def mock_get(url, *a, **k):
+        status, body = 404, ""
+        for needle, (st, bd) in by_path.items():
+            if needle in url:
+                status, body = st, bd
+                break
+        resp = AsyncMock()
+        resp.status_code = status
+        resp.text = body            # a real string, not a coroutine
+        resp.headers = {"server": "nginx"}
+        resp.url = url
+        return resp
 
-    # Create mock responses for different paths
-    mock_resp_200 = AsyncMock()
-    mock_resp_200.status_code = 200
-    mock_resp_200.headers = {"server": "nginx/1.18.0"}
-    mock_resp_200.url = "http://example.com/.git/HEAD"
-
-    mock_resp_404 = AsyncMock()
-    mock_resp_404.status_code = 404
-    mock_resp_404.headers = {"server": "nginx/1.18.0"}
-    mock_resp_404.url = "http://example.com/.env"
-
-    mock_resp_403 = AsyncMock()
-    mock_resp_403.status_code = 403
-    mock_resp_403.headers = {"server": "nginx/1.18.0"}
-    mock_resp_403.url = "http://example.com/server-status"
-
-    # Mock the httpx.AsyncClient
-    mock_client_instance = AsyncMock()
-    mock_client_instance.__aenter__.return_value = mock_client_instance
-    mock_client_instance.__aexit__.return_value = None
-
-    # Return different responses based on URL
-    def mock_get(url):
-        if ".git/HEAD" in url:
-            return mock_resp_200
-        elif ".env" in url:
-            return mock_resp_404
-        elif "server-status" in url:
-            return mock_resp_403
-        else:
-            # Default to 404 for other paths
-            return mock_resp_404
-
-    mock_client_instance.get.side_effect = mock_get
-
-    with patch("recon_orchestrator.sensitive_checks.checks.httpx.AsyncClient") as mock_client:
-        mock_client.return_value = mock_client_instance
-
-        findings = await check_sensitive_paths("example.com", settings, [80])
-
-        # Should have found the .git/HEAD path (status 200 < 500)
-        # and the server-status path (status 403 < 500)
-        # but not the .env path (we're only checking that it returned something < 500)
-        # Actually, 404 is also < 500, so it would be included
-        # Let's check that we got responses
-        assert len(findings) > 0
-
-        # Check that we have probes for the paths we tested
-        urls = {str(f.url) for f in findings}
-        # At least some of our test paths should be found
-        assert any("example.com" in url for url in urls)
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = None
+    client.get.side_effect = mock_get
+    return client
 
 
 @pytest.mark.asyncio
-async def test_run_sensitive_checks_mocked():
-    """Test running all sensitive checks with mocked responses."""
-    settings = Settings(
-        requests_per_second=2.0,
-        max_concurrency=10,
-        http_timeout=15.0,
-        connect_timeout=5.0,
-        max_retries=3,
-        backoff_base=1.0,
-        backoff_max=30.0,
-        user_agent="test-agent/1.0",
-        verify_tls=True,
-        cve_index_url=None,
-    )
-
-    # Create mock responses
-    mock_resp = AsyncMock()
-    mock_resp.status_code = 200
-    mock_resp.headers = {
-        "server": "nginx/1.18.0",
-        "access-control-allow-origin": "*",  # CORS misconfiguration
-        "strict-transport-security": "max-age=31536000",  # This one is present
-        # Missing: x-content-type-options, x-frame-options, etc.
-        "set-cookie": "sessionid=abc123; Path=/"  # Missing HttpOnly, Secure, SameSite
+async def test_only_content_verified_secrets_are_reported():
+    """A 200 that actually serves a .git config is a finding; a 200 that serves
+    the SPA's index.html for the same path is not."""
+    settings = Settings(user_agent="test/1.0")
+    responses = {
+        "/.git/config": (200, "[core]\n\trepositoryformatversion = 0\n"),  # real
+        "/.env": (200, "<!doctype html><title>App</title>"),               # SPA 200
+        "/wp-config.php": (200, "<?php define('DB_PASSWORD','s3cret'); ?>"),  # real
     }
-    mock_resp.url = "http://example.com/"
+    client = _mock_client_returning(responses)
+    with patch("recon_orchestrator.sensitive_checks.checks.httpx.AsyncClient",
+               return_value=client):
+        findings = await check_sensitive_paths("example.com", settings, [443])
 
-    # Mock the httpx.AsyncClient
-    mock_client_instance = AsyncMock()
-    mock_client_instance.__aenter__.return_value = mock_client_instance
-    mock_client_instance.__aexit__.return_value = None
-    mock_client_instance.head.return_value = mock_resp
-    mock_client_instance.get.return_value = mock_resp
+    paths = {f.title for f in findings}
+    assert "/.git/config" in paths       # content matched
+    assert "/wp-config.php" in paths      # content matched
+    assert "/.env" not in paths           # SPA html rejected
 
-    with patch("recon_orchestrator.sensitive_checks.checks.httpx.AsyncClient") as mock_client:
-        mock_client.return_value = mock_client_instance
 
-        findings = await run_sensitive_checks("example.com", settings, [80])
+@pytest.mark.asyncio
+async def test_redirects_and_404s_are_not_findings():
+    """A redirect to a login page (307) or a 404 means the file is not there."""
+    settings = Settings(user_agent="test/1.0")
+    responses = {
+        "/.git/config": (307, ""),   # redirect to login
+        "/.env": (404, ""),
+        "/server-status": (403, "forbidden"),
+    }
+    client = _mock_client_returning(responses)
+    with patch("recon_orchestrator.sensitive_checks.checks.httpx.AsyncClient",
+               return_value=client):
+        findings = await check_sensitive_paths("example.com", settings, [443])
 
-        # Should have findings from both path scanning and header/cookie checks
-        assert len(findings) > 0
+    assert findings == []
 
-        # We should have at least one finding from the HEAD request (header/cookie checks)
-        # and potentially from path scanning
 
-        # Check that we have probes
-        assert all(isinstance(f, HostProbe) for f in findings)
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+@pytest.mark.asyncio
+async def test_run_sensitive_checks_returns_probes_without_error():
+    """The aggregator runs without raising and returns a list of HostProbes."""
+    settings = Settings(user_agent="test/1.0")
+    client = _mock_client_returning({"/.git/config": (200, "[core]\n")})
+    with patch("recon_orchestrator.sensitive_checks.checks.httpx.AsyncClient",
+               return_value=client):
+        findings = await run_sensitive_checks("example.com", settings, [443])
+    assert isinstance(findings, list)
+    assert all(isinstance(f, HostProbe) for f in findings)

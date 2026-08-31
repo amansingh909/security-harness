@@ -74,6 +74,7 @@ async def test_fetch_crtsh_for_apex_with_real_response():
     mock_session = AsyncMock()
     mock_response = AsyncMock()
     mock_response.text = mock_html
+    mock_response.status_code = 200
     mock_response.raise_for_status = AsyncMock()
     mock_session.get.return_value = mock_response
 

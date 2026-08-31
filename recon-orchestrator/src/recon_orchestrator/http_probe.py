@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import re
+import socket
 
 from .config import Settings
 from .fingerprint import fingerprint
@@ -15,6 +16,34 @@ from .ratelimit import TokenBucket
 log = logging.getLogger(__name__)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+_DNS_MARKERS = (
+    "name or service not known",
+    "nodename nor servname provided",
+    "temporary failure in name resolution",
+    "no address associated with hostname",
+    "name does not resolve",
+    "getaddrinfo failed",
+)
+
+
+def _is_dns_failure(exc: BaseException) -> bool:
+    """True if this exception is a name-resolution failure.
+
+    Retrying these is pointless — the hostname will not start existing between
+    attempts — and each retry ladder costs ~7s per scheme.
+    """
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, socket.gaierror):
+            return True
+        text = str(exc).lower()
+        if any(marker in text for marker in _DNS_MARKERS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _extract_title(body: str) -> str | None:
@@ -70,6 +99,13 @@ class HttpProber:
                         fingerprints=fingerprint(headers, title),
                     )
                 except (httpx.TransportError, httpx.HTTPError) as exc:
+                    # A name that does not resolve will not resolve on retry.
+                    # Backing off 1s/2s/4s per scheme on NXDOMAIN cost ~15s per
+                    # dead seed host for nothing, so give up on this scheme now.
+                    if _is_dns_failure(exc):
+                        log.info("host does not resolve; skipping scheme",
+                                 extra={"host": host, "scheme": scheme})
+                        break
                     if attempt > self._s.max_retries:
                         log.info("probe failed on scheme; trying next",
                                  extra={"host": host, "scheme": scheme,

@@ -13,13 +13,17 @@ failures for each platform.
 Environment variables (or explicit arguments) are expected to contain the
 API tokens:
 
-- H1_API_KEY : HackerOne API token (Basic auth: token:)
-- BC_API_KEY : Bugcrowd API token (token auth: Token <token>)
+- H1_IDENTIFIER : HackerOne API identifier (username half of the credential)
+- H1_API_KEY    : HackerOne API token; sent as Basic identifier:token
+- BC_API_KEY    : Bugcrowd API token (token auth: Token <token>)
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
+import os
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
@@ -58,22 +62,43 @@ def _build_finding(
     # Use the first CVE (if any) for CVSS/CWE fields
     first_cve = vuln.get("cves", [{}])[0] if vuln.get("cves") else {}
     cvss_vector = first_cve.get("cvss_vector")
-    cvss_score = first_cve.get("cvss_score")
+    # cvss_score is read by the caller straight off the vuln dict; Finding has
+    # no field for it.
     # We don't have CWE from the batch report; leave None.
     cwe = None
 
     # Asset string for Bugcrowd
     asset = f"{host}:{port}" if port else host
 
-    # Placeholder text – the user should replace this with real PoC steps
-    steps = (
-        "Automated scan detected a potential vulnerability. "
-        "See the full report for technical details."
+    # Finding.vuln_type is required. Name the CVE when we have one, otherwise
+    # describe what the scan actually observed.
+    cve_id = first_cve.get("id")
+    vuln_type = (
+        f"Known vulnerability {cve_id} in exposed service" if cve_id
+        else "Exposed service with potentially vulnerable software version"
     )
-    observed = "Potential vulnerability identified via automated recon."
+
+    # steps_to_reproduce is a list[str] with min_length=1 — a single string
+    # fails validation. Include the fingerprint that triggered the match so the
+    # steps are reproducible rather than a bare placeholder.
+    steps = [
+        f"Request {scheme}://{asset} over {scheme.upper()}.",
+        f"Observe the response banner: server={server}, x-powered-by={powered_by}.",
+        (
+            f"Compare that version against {cve_id}."
+            if cve_id
+            else "Compare the reported version against known advisories."
+        ),
+        "See the attached batch report for the full scan output.",
+    ]
+    observed = (
+        f"{host}:{port} responds with server={server!r}, x-powered-by={powered_by!r}"
+        + (f", matching {cve_id}." if cve_id else ".")
+    )
     impact = "Potential security issue affecting the asset."
 
     return Finding(
+        vuln_type=vuln_type,
         title=title,
         steps_to_reproduce=steps,
         observed_result=observed,
@@ -89,11 +114,23 @@ def _build_finding(
     )
 
 
+def _h1_auth_header(identifier: str, token: str) -> str:
+    """Build HackerOne's Authorization header.
+
+    HackerOne authenticates with HTTP Basic, not Bearer: the API identifier is
+    the username half and the API token is the password half, joined by a colon
+    and base64-encoded. Sending ``Bearer <token>`` returns 401 every time.
+    """
+    raw = f"{identifier}:{token}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
 def upload_report(
     report_path: Path | str,
     program: str,
     h1_api_key: str | None,
     bc_api_key: str | None,
+    h1_identifier: str | None = None,
 ) -> Dict[str, Any]:
     """
     Upload all findings in ``report_path`` to HackerOne and/or Bugcrowd.
@@ -108,6 +145,11 @@ def upload_report(
         HackerOne API token. If ``None``, HackerOne upload is skipped.
     bc_api_key: str | None
         Bugcrowd API token. If ``None``, Bugcrowd upload is skipped.
+    h1_identifier: str | None
+        HackerOne API identifier (the username half of the credential, shown
+        beside the token under Settings -> API Tokens). Falls back to the
+        ``H1_IDENTIFIER`` environment variable. HackerOne authenticates with
+        HTTP Basic ``identifier:token`` — the token alone is not enough.
 
     Returns
     -------
@@ -121,6 +163,15 @@ def upload_report(
 
     data = json.loads(report_path.read_text(encoding="utf-8"))
     vulns: list[dict] = data.get("vulnerabilities", [])
+
+    # Resolve the HackerOne identifier once and fail up front, rather than
+    # letting every finding 401 individually.
+    h1_identifier = h1_identifier or os.getenv("H1_IDENTIFIER")
+    if h1_api_key and not h1_identifier:
+        raise ValueError(
+            "HackerOne needs an API identifier as well as a token. Find it under "
+            "Settings -> API Tokens and set H1_IDENTIFIER in ~/.harness/.env."
+        )
 
     results: Dict[str, Any] = {
         "hackerone": {"sent": 0, "failed": 0, "errors": []},
@@ -145,6 +196,10 @@ def upload_report(
 
         for vuln in vulns:
             finding = _build_finding(program, vuln)
+            # The scan already carries a numeric score. Deriving one from the
+            # vector string does not work — splitting "CVSS:3.1/AV:N/AC:L" on
+            # "/" yields "AV:N", and float("AV:N") raises.
+            cvss_score = ((vuln.get("cves") or [{}])[0]).get("cvss_score")
 
             # HackerOne
             if h1_api_key:
@@ -152,12 +207,12 @@ def upload_report(
                     finding,
                     markdown="",  # markdown not required for submission; we can leave empty
                     rating="UNKNOWN",  # we don't have a rating; will map to "none"
-                    cvss_score=None if finding.cvss_vector is None else float(finding.cvss_vector.split("/")[1]) if "/" in finding.cvss_vector else 5.0,  # rough fallback
+                    cvss_score=cvss_score,
                     cwe=finding.cwe,
                 )
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {h1_api_key}",
+                    "Authorization": _h1_auth_header(h1_identifier, h1_api_key),
                 }
                 tasks_h1.append(
                     (
@@ -187,15 +242,10 @@ def upload_report(
                     )
                 )
 
-        # Run all requests concurrently (limited concurrency to avoid rate limits)
-        semaphore = httpx.AsyncHTTPTransport(retries=2)  # not ideal; we'll just gather with a semaphore via asyncio
-        # Simpler: use asyncio.Semaphore inside a wrapper
+        # Run all requests concurrently, capped so we stay polite to the API.
         async def _sem_post(url, payload, headers, sem: asyncio.Semaphore):
             async with sem:
                 return await _post_json(url, payload, headers)
-
-        # We'll create the semaphores inside the function; need asyncio imported
-        import asyncio
 
         sem = asyncio.Semaphore(5)
 

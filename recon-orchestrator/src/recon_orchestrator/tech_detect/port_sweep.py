@@ -6,6 +6,7 @@ All requests are scoped to the target host and use only GET/HEAD (no payloads).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Set
 
