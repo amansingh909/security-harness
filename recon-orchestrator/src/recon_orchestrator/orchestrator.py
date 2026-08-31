@@ -56,7 +56,7 @@ class ReconOrchestrator:
             probe = await prober.probe(host)
             active_signals: list[str] = []
             if self._s.active_tests and not probe.error:
-                active_signals = await self._run_active_tests(prober, host)
+                active_signals = await self._run_active_tests(prober, probe)
             candidates: list[CveCandidate] = []
             if probe.fingerprints and self._s.cve_index_url and not probe.error:
                 try:
@@ -173,21 +173,25 @@ class ReconOrchestrator:
                 score += 6
         return signals, score
 
-    async def _run_active_tests(self, prober: HttpProber, host: str) -> list[str]:
+    async def _run_active_tests(self, prober: HttpProber, probe: HostProbe) -> list[str]:
         """Active testing for a host — OWNED ASSETS ONLY.
 
         Reached only when ``active_tests`` is set. Routes to a real OWASP ZAP
         scan when ``use_zap`` is on, otherwise the lightweight built-in tester.
+        Uses the URL the probe actually reached, so an http-only host or a
+        non-standard port is tested correctly instead of a guessed https URL.
         """
+        host = probe.host
+        base = (probe.url or f"https://{host}").rstrip("/")
         # Loud, per-host record that active traffic is being sent.
         log.warning("active tests enabled — sending crafted input to owned target",
                     extra={"host": host, "engine": "zap" if self._s.use_zap else "builtin"})
         if self._s.use_zap:
-            return await self._run_zap(host)
-        return await self._run_builtin_active(prober, host)
+            return await self._run_zap(host, base)
+        return await self._run_builtin_active(prober, host, base)
 
-    async def _run_zap(self, host: str) -> list[str]:
-        """Drive an OWASP ZAP spider + active scan against ``host``.
+    async def _run_zap(self, host: str, base: str) -> list[str]:
+        """Drive an OWASP ZAP spider + active scan against ``base``.
 
         Alerts are filtered back through scope, so even if ZAP's spider wandered
         off-host, only in-scope findings are reported.
@@ -198,10 +202,9 @@ class ReconOrchestrator:
             log.warning("use_zap set but ZAP_API_URL / ZAP_API_KEY are missing",
                         extra={"host": host})
             return []
-        target = f"https://{host}"
         try:
             async with ZapClient(self._s.zap_api_url, self._s.zap_api_key) as zap:
-                alerts = await zap.scan(target, max_wait=self._s.zap_max_wait)
+                alerts = await zap.scan(base, max_wait=self._s.zap_max_wait)
         except Exception as exc:  # noqa: BLE001 - ZAP down / unreachable
             log.warning("ZAP scan failed", extra={"host": host, "error": str(exc)})
             return []
@@ -213,7 +216,7 @@ class ReconOrchestrator:
         signals, _score = alerts_to_signals(in_scope)
         return signals
 
-    async def _run_builtin_active(self, prober: HttpProber, host: str) -> list[str]:
+    async def _run_builtin_active(self, prober: HttpProber, host: str, base: str) -> list[str]:
         """Lightweight built-in tester: discover a page's inputs, scope-check
         each, inject the payloads. Marker/signature detection, rate-limited.
         No external dependency — the fallback when ZAP is not configured.
@@ -225,7 +228,7 @@ class ReconOrchestrator:
 
         # 1. Fetch the page to discover its inputs.
         try:
-            page = await prober.send(httpx.Request("GET", f"https://{host}/"))
+            page = await prober.send(httpx.Request("GET", base + "/"))
         except Exception:  # noqa: BLE001
             return []
         points = extract_injection_points(str(page.url), page.text or "")
