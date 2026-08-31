@@ -327,11 +327,11 @@ class ReconOrchestrator:
         if owns_prober:
             bucket = TokenBucket(self._s.requests_per_second)
             prober = HttpProber(self._s, bucket)
+        tasks = [
+            asyncio.create_task(self._probe_one(prober, host))
+            for host in authorized
+        ]
         try:
-            tasks = [
-                asyncio.create_task(self._probe_one(prober, host))
-                for host in authorized
-            ]
             probes: list[HostProbe] = list(extra_probes)
             cve_by_host: dict[str, list[CveCandidate]] = {}
             active_by_host: dict[str, list[str]] = {}
@@ -345,6 +345,14 @@ class ReconOrchestrator:
                 if active_signals:
                     active_by_host[probe.host] = active_signals
         finally:
+            # If we exit early (cancelled — you quit the TUI mid-scan), cancel
+            # the in-flight probes so their cleanup runs; a probe driving ZAP
+            # stops the ZAP scan on cancel. Shielded so it completes even while
+            # we ourselves are being cancelled.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
             if owns_prober:
                 await prober.aclose()
 

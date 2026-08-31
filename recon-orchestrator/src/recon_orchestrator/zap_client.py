@@ -58,28 +58,39 @@ class ZapClient:
 
     async def _run_and_wait(self, action: str, status_view: str, url: str,
                             max_wait: float) -> None:
-        """Start an async ZAP scan and poll its status view to 100%."""
+        """Start an async ZAP scan and poll its status view to 100%.
+
+        On ANY early exit that is not completion — the time budget elapsing, or
+        the caller being cancelled (you quit the TUI / Ctrl-C mid-scan) — the
+        scan is stopped so ZAP does not keep attacking the target in the
+        background.
+        """
         started = await self._get(action, url=url)
         scan_id = started.get("scan")
         if scan_id is None:
             raise ZapError(f"{action} did not return a scan id: {started}")
-        deadline = asyncio.get_event_loop().time() + max_wait
-        while asyncio.get_event_loop().time() < deadline:
-            status = (await self._get(status_view, scanId=scan_id)).get("status", "0")
-            if str(status) == "100":
-                return
-            await asyncio.sleep(self._poll)
 
-        # Budget elapsed: tell ZAP to STOP so it does not keep scanning the
-        # target in the background after we have returned. Without this the
-        # daemon keeps spidering/attacking and the next scan queues behind it.
-        stop_action = action.rsplit("/", 1)[0] + "/stop"
+        completed = False
         try:
-            await self._get(stop_action, scanId=scan_id)
-        except ZapError:
-            pass
-        log.warning("ZAP scan hit the time budget — stopped it",
-                    extra={"action": action, "url": url, "max_wait": max_wait})
+            deadline = asyncio.get_event_loop().time() + max_wait
+            while asyncio.get_event_loop().time() < deadline:
+                status = (await self._get(status_view, scanId=scan_id)).get("status", "0")
+                if str(status) == "100":
+                    completed = True
+                    return
+                await asyncio.sleep(self._poll)
+            log.warning("ZAP scan hit the time budget — stopping it",
+                        extra={"action": action, "url": url, "max_wait": max_wait})
+        finally:
+            if not completed:
+                # Shield the stop so a cancellation still delivers it to ZAP.
+                stop_action = action.rsplit("/", 1)[0] + "/stop"
+                try:
+                    await asyncio.shield(self._get(stop_action, scanId=scan_id))
+                except asyncio.CancelledError:
+                    raise          # propagate; the stop was already dispatched
+                except Exception:  # noqa: BLE001 - best-effort stop
+                    pass
 
     async def add_request_header(self, name: str, value: str) -> None:
         """Make ZAP send ``name: value`` on every request (spider + scan).

@@ -161,3 +161,36 @@ async def test_stages_off_by_flag_make_no_calls(monkeypatch):
     await orch.run(["www.example.com"], prober=FakeProber({}))
 
     assert called == {"crtsh": False, "sensitive": False}
+
+
+@pytest.mark.asyncio
+async def test_run_cancels_inflight_probes_when_cancelled():
+    """Quitting mid-scan cancels run(); its in-flight probes must be cancelled
+    too (a probe driving ZAP stops the ZAP scan on cancel)."""
+    import asyncio
+    from recon_orchestrator.config import Settings
+    cancelled = {"probe": False}
+
+    class SlowProber:
+        async def probe(self, host):
+            try:
+                await asyncio.sleep(100)
+            except asyncio.CancelledError:
+                cancelled["probe"] = True
+                raise
+            return HostProbe(host=host, status=200, port=443)
+
+        async def aclose(self):
+            pass
+
+    orch = ReconOrchestrator(
+        Settings(enable_subdomain_enum=False, enable_sensitive_checks=False),
+        ScopeGuard(in_scope=["demo.local"], out_of_scope=[]),
+    )
+    task = asyncio.create_task(orch.run(["demo.local"], prober=SlowProber()))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+    assert cancelled["probe"], "in-flight probe was not cancelled with run()"

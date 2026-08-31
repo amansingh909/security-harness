@@ -89,6 +89,35 @@ async def test_scan_stops_zap_when_budget_elapses():
 
 
 @pytest.mark.asyncio
+async def test_scan_stops_zap_when_cancelled_midscan():
+    """Quitting mid-scan (task cancelled) must still tell ZAP to stop."""
+    import asyncio
+    stopped: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p.endswith("/action/scan/"):
+            return httpx.Response(200, json={"scan": "0"})
+        if p.endswith("/view/status/"):
+            return httpx.Response(200, json={"status": "40"})  # never done
+        if p.endswith("/action/stop/"):
+            stopped.append(p)
+            return httpx.Response(200, json={"Result": "OK"})
+        return httpx.Response(200, json={"alerts": []})
+
+    z = ZapClient("http://zap", "k",
+                  transport=httpx.MockTransport(handler), poll_interval=0.01)
+    task = asyncio.create_task(z.scan("https://demo.local", max_wait=100))
+    await asyncio.sleep(0.05)          # let the spider start and poll
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)          # let the shielded stop reach ZAP
+    await z._client.aclose()
+    assert any("/action/stop" in s for s in stopped), "scan was not stopped on cancel"
+
+
+@pytest.mark.asyncio
 async def test_scan_drives_spider_ascan_then_alerts():
     async with ZapClient("http://zap", "k", transport=_zap_transport(ALERTS),
                          poll_interval=0) as z:
