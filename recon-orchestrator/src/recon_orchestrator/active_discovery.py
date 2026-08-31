@@ -18,6 +18,7 @@ from html.parser import HTMLParser
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 MAX_INJECTION_POINTS = 40
+MAX_CRAWL_PAGES = 12       # bounded same-host crawl to reach deeper parameters
 
 
 @dataclass(frozen=True)
@@ -127,3 +128,28 @@ def inject(point: InjectionPoint, value: str) -> str:
     """Build a URL that puts ``value`` in ``point.param``, preserving siblings."""
     params = list(point.base_params) + [(point.param, value)]
     return f"{point.url}?{urlencode(params)}"
+
+
+def extract_links(page_url: str, html: str) -> list[str]:
+    """Absolute http(s) links on the page, for a bounded crawl.
+
+    Query strings are stripped and fragments dropped so the crawl visits
+    distinct pages rather than re-fetching the same page with different params.
+    """
+    ex = _Extractor(page_url)
+    try:
+        ex.feed(html)
+        ex.close()
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[str] = []
+    seen: set[str] = set()
+    for link in ex.links:
+        u = urlparse(link)
+        if not u.scheme.startswith("http"):
+            continue
+        base = _strip_query(link).split("#", 1)[0]
+        if base not in seen:
+            seen.add(base)
+            out.append(base)
+    return out

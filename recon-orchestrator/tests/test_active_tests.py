@@ -131,6 +131,44 @@ async def test_active_tests_discover_then_inject_and_flag():
 
 
 @pytest.mark.asyncio
+async def test_crawl_reaches_parameters_a_page_deeper():
+    """Params often live below the landing page (the testphp case). The bounded
+    crawl must follow same-host links to reach them."""
+    class DeepProber:
+        def __init__(self): self.sent = []
+        async def probe(self, host): return HostProbe(host=host, status=200, port=443)
+        async def send(self, request):
+            self.sent.append(request)
+            path = request.url.path
+            if request.url.query:  # an injected request -> reflect it back
+                from urllib.parse import unquote
+                return httpx.Response(200, text="<html>" + unquote(request.url.query) + "</html>",
+                                      request=request)
+            if path in ("/", ""):
+                # homepage: no params, just a link to a listing page
+                return httpx.Response(200, request=request,
+                                      text='<a href="/categories">browse</a>')
+            if path == "/categories":
+                # one level deeper: here is the parameterized endpoint
+                return httpx.Response(200, request=request,
+                                      text='<a href="/listproducts?cat=1">cat 1</a>')
+            return httpx.Response(200, text="<html>ok</html>", request=request)
+        async def aclose(self): pass
+
+    settings = Settings(active_tests=True, enable_subdomain_enum=False,
+                        enable_sensitive_checks=False)
+    orch = ReconOrchestrator(settings, ScopeGuard(["*.demo.local", "demo.local"], []))
+    prober = DeepProber()
+    findings = await orch.run(["demo.local"], prober=prober)
+
+    # it crawled home -> /categories -> found /listproducts?cat= and injected there
+    assert any("/listproducts" in r.url.path and r.url.query for r in prober.sent), \
+        "crawl never reached the deeper parameter"
+    xss = [s for f in findings for s in f.signals if "/listproducts" in s and "cat" in s]
+    assert xss, f"expected a signal on the deep param, got {[f.signals for f in findings]}"
+
+
+@pytest.mark.asyncio
 async def test_active_tests_scope_gate_offsite_links():
     """A page linking off-domain must not get payloads sent off-domain."""
     class OffsiteProber(ScriptedProber):

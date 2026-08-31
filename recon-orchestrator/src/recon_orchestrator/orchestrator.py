@@ -224,17 +224,44 @@ class ReconOrchestrator:
         import httpx
 
         from . import payloads
-        from .active_discovery import extract_injection_points, inject
+        from .active_discovery import (
+            MAX_CRAWL_PAGES, extract_injection_points, extract_links, inject,
+        )
 
-        # 1. Fetch the page to discover its inputs.
-        try:
-            page = await prober.send(httpx.Request("GET", base + "/"))
-        except Exception:  # noqa: BLE001
-            return []
-        points = extract_injection_points(str(page.url), page.text or "")
+        # 1. Bounded same-host crawl to discover inputs — many params live a
+        #    page or two deeper than the landing page, so a single fetch misses
+        #    them. Only in-scope pages are visited.
+        points: list = []
+        point_keys: set[tuple[str, str]] = set()
+        visited: set[str] = set()
+        queue: list[str] = [base + "/"]
+        while queue and len(visited) < MAX_CRAWL_PAGES:
+            if self._shutdown.is_set():
+                break
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+            page_host = httpx.URL(url).host
+            if self._scope.verdict(page_host or host).status != "in":
+                continue
+            try:
+                page = await prober.send(httpx.Request("GET", url))
+            except Exception:  # noqa: BLE001
+                continue
+            body = page.text or ""
+            for pt in extract_injection_points(str(page.url), body):
+                key = (pt.url, pt.param)
+                if key not in point_keys:
+                    point_keys.add(key)
+                    points.append(pt)
+            for link in extract_links(str(page.url), body):
+                if link not in visited and httpx.URL(link).host == page_host:
+                    queue.append(link)
+
         if not points:
             log.info("active tests: no injectable parameters found",
-                     extra={"host": host})
+                     extra={"host": host, "pages_crawled": len(visited)})
             return []
 
         # 2. Inject into each in-scope discovered parameter.
