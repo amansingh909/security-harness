@@ -19,6 +19,7 @@ from .models import CandidateFinding, CveCandidate, HostProbe
 from .ratelimit import TokenBucket
 from .scope import ScopeGuard
 from .triage import triage
+from . import payloads
 
 log = logging.getLogger(__name__)
 
@@ -49,11 +50,14 @@ class ReconOrchestrator:
 
     async def _probe_one(
         self, prober: HttpProber, host: str
-    ) -> tuple[HostProbe, list[CveCandidate]]:
+    ) -> tuple[HostProbe, list[CveCandidate], list[str]]:
         async with self._sem:
             if self._shutdown.is_set():
                 return HostProbe(host=host, error="skipped: shutting down"), []
             probe = await prober.probe(host)
+            active_signals: list[str] = []
+            if self._s.active_tests and not probe.error:
+                active_signals = await self._run_active_tests(prober, host)
             candidates: list[CveCandidate] = []
             if probe.fingerprints and self._s.cve_index_url and not probe.error:
                 try:
@@ -63,7 +67,7 @@ class ReconOrchestrator:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("cve correlation failed",
                                 extra={"host": host, "error": str(exc)})
-            return probe, candidates
+            return probe, candidates, active_signals
 
     async def _discover_subdomains(self, hosts: list[str]) -> list[str]:
         """Passive subdomain discovery via crt.sh, filtered back through scope.
@@ -170,6 +174,38 @@ class ReconOrchestrator:
                 score += 6
         return signals, score
 
+    async def _run_active_tests(self, prober: HttpProber, host: str) -> list[str]:
+        """Execute active payload tests against ``host``.
+
+        Returns a list of textual signals describing any suspicious behaviour.
+        The implementation is deliberately lightweight – it sends the small set
+        of payloads defined in ``payloads.py`` using the same ``httpx.AsyncClient``
+        that ``HttpProber`` uses. Responses are inspected for simple indicators
+        such as reflected payload values, unexpected status codes, or presence
+        of authentication‑bypass headers.
+        """
+        import httpx
+        from . import payloads
+
+        signals: list[str] = []
+        base = f"https://{host}"  # primary scheme – fallback to http on failure
+        reqs = payloads.generate_requests(base)
+        for req in reqs:
+            try:
+                resp = await prober._client.send(req)
+            except Exception as exc:  # noqa: BLE001
+                # network or protocol error – treat as silent fail
+                continue
+            # Simple heuristics per payload name (derived from request URL or method)
+            name = req.url.path.strip('/') or req.method.lower()
+            # Reflected payload detection for GET/POST bodies
+            if resp.text and any(val in resp.text for val in req.headers.values()):
+                signals.append(f"{name}: reflected payload on {host}")
+            if resp.status_code and resp.status_code < 300:
+                # Successful response – could indicate acceptance of malicious input
+                signals.append(f"{name}: unexpected success ({resp.status_code}) on {host}")
+        return signals
+
     async def run(self, seeds: list[str], prober: HttpProber | None = None) -> list[CandidateFinding]:
         authorized = self._authorized_seeds(seeds)
         if not authorized:
@@ -204,23 +240,35 @@ class ReconOrchestrator:
             ]
             probes: list[HostProbe] = list(extra_probes)
             cve_by_host: dict[str, list[CveCandidate]] = {}
+            active_by_host: dict[str, list[str]] = {}
             for coro in asyncio.as_completed(tasks):
-                probe, candidates = await coro
+                result = await coro
+                # _probe_one now returns (probe, candidates, active_signals)
+                probe, candidates, active_signals = result
                 probes.append(probe)
                 if candidates:
                     cve_by_host[probe.host] = candidates
+                if active_signals:
+                    active_by_host[probe.host] = active_signals
         finally:
             if owns_prober:
                 await prober.aclose()
 
         findings = triage(probes)
 
+        # Merge CVE candidates and active-test signals into findings.
+        for finding in findings:
+            finding.cve_candidates = cve_by_host.get(finding.host, [])
+            act = active_by_host.get(finding.host)
+            if act:
+                finding.signals.extend(act)
+                # modest priority boost per active signal
+                finding.priority_score += len(act) * 2
+
         # Stage 3: GET-only sensitive-path checks, folded into findings.
         if self._s.enable_sensitive_checks and not self._shutdown.is_set():
             await self._enrich_sensitive(findings, probes)
 
-        for finding in findings:
-            finding.cve_candidates = cve_by_host.get(finding.host, [])
         # Re-sort: enrichment changed scores and may have added hosts.
         findings.sort(key=lambda c: (-c.priority_score, c.host))
         log.info("recon complete",

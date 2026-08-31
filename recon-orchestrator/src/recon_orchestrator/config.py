@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     enable_subdomain_enum: bool = True
     enable_sensitive_checks: bool = True
     enable_port_sweep: bool = False
+    # Enable active payload testing (POST/PUT/DELETE with crafted inputs)
+    active_tests: bool = False
 
     # --- CVE correlation (optional) --------------------------------------
     cve_index_url: str | None = None     # e.g. http://localhost:8080
