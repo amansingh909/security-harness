@@ -39,9 +39,16 @@ async def run_recon(program: Program) -> list[dict]:
         except OSError as exc:
             raise ComponentMissing(f"seeds_file unreadable: {exc}") from exc
 
+    import os
     settings = Settings(
         requests_per_second=program.requests_per_second,
         cve_index_url=program.cve_index_url,
+        # Active testing is per-program and owned-assets-only. ZAP credentials
+        # come from the environment (~/.harness/.env), never the program file.
+        active_tests=program.active_tests,
+        use_zap=program.use_zap,
+        zap_api_url=os.getenv("ZAP_API_URL"),
+        zap_api_key=os.getenv("ZAP_API_KEY"),
     )
     scope = ScopeGuard(
         program.in_scope, program.out_of_scope, program.allow_multilevel_wildcard

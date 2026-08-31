@@ -1,0 +1,127 @@
+"""Tests for the OWASP ZAP active-scan integration.
+
+Mocks ZAP's REST API with an httpx transport, so no real ZAP or target is
+touched. Verifies the spider -> active-scan -> alerts flow, the alert-to-signal
+mapping, and that the orchestrator scope-gates ZAP's alerts.
+"""
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from recon_orchestrator.config import Settings
+from recon_orchestrator.models import HostProbe
+from recon_orchestrator.orchestrator import ReconOrchestrator
+from recon_orchestrator.scope import ScopeGuard
+from recon_orchestrator.zap_client import ZapClient, alerts_to_signals
+
+
+def _zap_transport(alerts):
+    """A mock ZAP: scans report done immediately, alerts view returns `alerts`."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p.endswith("/spider/action/scan/"):
+            return httpx.Response(200, json={"scan": "0"})
+        if p.endswith("/spider/view/status/"):
+            return httpx.Response(200, json={"status": "100"})
+        if p.endswith("/ascan/action/scan/"):
+            return httpx.Response(200, json={"scan": "1"})
+        if p.endswith("/ascan/view/status/"):
+            return httpx.Response(200, json={"status": "100"})
+        if p.endswith("/core/view/alerts/"):
+            return httpx.Response(200, json={"alerts": alerts})
+        if p.endswith("/core/view/version/"):
+            return httpx.Response(200, json={"version": "2.17.0"})
+        return httpx.Response(404, json={"detail": "not found"})
+    return httpx.MockTransport(handler)
+
+
+ALERTS = [
+    {"alert": "SQL Injection", "risk": "High", "url": "https://demo.local/item?id=1",
+     "param": "id", "cweid": "89"},
+    {"alert": "Reflected XSS", "risk": "Medium", "url": "https://demo.local/search?q=x",
+     "param": "q"},
+    {"alert": "X-Content-Type-Options missing", "risk": "Low",
+     "url": "https://demo.local/", "param": ""},
+    # duplicate of the SQLi — must collapse
+    {"alert": "SQL Injection", "risk": "High", "url": "https://demo.local/item?id=1",
+     "param": "id"},
+    # off-scope host — the orchestrator must drop this
+    {"alert": "SQL Injection", "risk": "High", "url": "https://evil.com/x?p=1",
+     "param": "p"},
+]
+
+
+# --- client flow -------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_scan_drives_spider_ascan_then_alerts():
+    async with ZapClient("http://zap", "k", transport=_zap_transport(ALERTS),
+                         poll_interval=0) as z:
+        assert await z.version() == "2.17.0"
+        alerts = await z.scan("https://demo.local", max_wait=5)
+    assert len(alerts) == len(ALERTS)
+
+
+# --- alert mapping -----------------------------------------------------------
+
+def test_alerts_to_signals_scores_by_risk_and_dedupes():
+    signals, score = alerts_to_signals(ALERTS)
+    # 4 distinct (name,url,param): High SQLi, Medium XSS, Low header, evil.com High
+    joined = " ".join(signals)
+    assert "SQL Injection" in joined and "/item" in joined and "'id'" in joined
+    assert "[ZAP High]" in joined and "[ZAP Medium]" in joined
+    # the two identical SQLi alerts collapse to one
+    assert sum("/item via 'id'" in s for s in signals) == 1
+    # High=15, Medium=8, Low=3, plus the evil.com High=15 (mapping doesn't gate scope)
+    assert score == 15 + 8 + 3 + 15
+
+
+# --- orchestrator integration ------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_orchestrator_uses_zap_and_scope_gates_alerts(monkeypatch):
+    settings = Settings(active_tests=True, use_zap=True,
+                        zap_api_url="http://zap", zap_api_key="k",
+                        enable_subdomain_enum=False, enable_sensitive_checks=False)
+    scope = ScopeGuard(["*.demo.local", "demo.local"], [])
+    orch = ReconOrchestrator(settings, scope)
+
+    # patch ZapClient so _run_zap uses the mock transport and no sleeps
+    import recon_orchestrator.zap_client as zc
+    real_init = zc.ZapClient.__init__
+
+    def patched_init(self, api_url, api_key, timeout=30.0, transport=None, poll_interval=3.0):
+        real_init(self, api_url, api_key, timeout=timeout,
+                  transport=_zap_transport(ALERTS), poll_interval=0)
+    monkeypatch.setattr(zc.ZapClient, "__init__", patched_init)
+
+    class P:
+        async def probe(self, host): return HostProbe(host=host, status=200, port=443)
+        async def send(self, r): raise AssertionError("built-in tester must not run")
+        async def aclose(self): pass
+
+    findings = await orch.run(["demo.local"], prober=P())
+    all_signals = [s for f in findings for s in f.signals]
+    assert any("SQL Injection" in s for s in all_signals)
+    # the off-scope evil.com alert was filtered out
+    assert not any("evil.com" in s for s in all_signals)
+    # and no evil.com finding exists
+    assert all("evil.com" not in f.host for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_use_zap_without_credentials_is_graceful(monkeypatch):
+    settings = Settings(active_tests=True, use_zap=True,
+                        enable_subdomain_enum=False, enable_sensitive_checks=False)
+    scope = ScopeGuard(["demo.local"], [])
+    orch = ReconOrchestrator(settings, scope)
+
+    class P:
+        async def probe(self, host): return HostProbe(host=host, status=200, port=443)
+        async def send(self, r): raise AssertionError("should not send")
+        async def aclose(self): pass
+
+    # missing zap_api_key -> _run_zap returns [] without raising
+    findings = await orch.run(["demo.local"], prober=P())
+    assert findings == [] or all(f.signals for f in findings)

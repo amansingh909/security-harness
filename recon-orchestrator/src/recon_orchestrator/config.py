@@ -45,8 +45,15 @@ class Settings(BaseSettings):
     enable_subdomain_enum: bool = True
     enable_sensitive_checks: bool = True
     enable_port_sweep: bool = False
-    # Enable active payload testing (POST/PUT/DELETE with crafted inputs)
+    # Active testing — OWNED ASSETS ONLY. active_tests turns on crafted-input
+    # probing; use_zap routes it through a running OWASP ZAP instead of the
+    # lightweight built-in tester (ZAP is a real DAST engine — spider + active
+    # scan). ZAP creds are read from the environment, never committed.
     active_tests: bool = False
+    use_zap: bool = False
+    zap_api_url: str | None = None       # e.g. http://localhost:8081
+    zap_api_key: str | None = None
+    zap_max_wait: float = 300.0          # seconds to wait for spider+ascan
 
     # --- CVE correlation (optional) --------------------------------------
     cve_index_url: str | None = None     # e.g. http://localhost:8080

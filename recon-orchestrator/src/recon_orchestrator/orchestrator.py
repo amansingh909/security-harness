@@ -174,23 +174,54 @@ class ReconOrchestrator:
         return signals, score
 
     async def _run_active_tests(self, prober: HttpProber, host: str) -> list[str]:
-        """Crafted-input tests against a host's DISCOVERED inputs — OWNED ASSETS ONLY.
+        """Active testing for a host — OWNED ASSETS ONLY.
 
-        Reached only when ``active_tests`` is set. Fetches the page, extracts the
-        real links/GET-form parameters, scope-checks each endpoint, then injects
-        the payloads into those parameters. Requests go through the prober's rate
-        limiter, and detection is marker/signature based so a signal means the
-        response actually showed something.
+        Reached only when ``active_tests`` is set. Routes to a real OWASP ZAP
+        scan when ``use_zap`` is on, otherwise the lightweight built-in tester.
+        """
+        # Loud, per-host record that active traffic is being sent.
+        log.warning("active tests enabled — sending crafted input to owned target",
+                    extra={"host": host, "engine": "zap" if self._s.use_zap else "builtin"})
+        if self._s.use_zap:
+            return await self._run_zap(host)
+        return await self._run_builtin_active(prober, host)
+
+    async def _run_zap(self, host: str) -> list[str]:
+        """Drive an OWASP ZAP spider + active scan against ``host``.
+
+        Alerts are filtered back through scope, so even if ZAP's spider wandered
+        off-host, only in-scope findings are reported.
+        """
+        from .zap_client import ZapClient, alert_host, alerts_to_signals
+
+        if not self._s.zap_api_url or not self._s.zap_api_key:
+            log.warning("use_zap set but ZAP_API_URL / ZAP_API_KEY are missing",
+                        extra={"host": host})
+            return []
+        target = f"https://{host}"
+        try:
+            async with ZapClient(self._s.zap_api_url, self._s.zap_api_key) as zap:
+                alerts = await zap.scan(target, max_wait=self._s.zap_max_wait)
+        except Exception as exc:  # noqa: BLE001 - ZAP down / unreachable
+            log.warning("ZAP scan failed", extra={"host": host, "error": str(exc)})
+            return []
+
+        in_scope = [
+            a for a in alerts
+            if self._scope.verdict(alert_host(a) or host).status == "in"
+        ]
+        signals, _score = alerts_to_signals(in_scope)
+        return signals
+
+    async def _run_builtin_active(self, prober: HttpProber, host: str) -> list[str]:
+        """Lightweight built-in tester: discover a page's inputs, scope-check
+        each, inject the payloads. Marker/signature detection, rate-limited.
+        No external dependency — the fallback when ZAP is not configured.
         """
         import httpx
 
         from . import payloads
         from .active_discovery import extract_injection_points, inject
-
-        # Loud, per-host record that active traffic is being sent — this is the
-        # mode that must never touch a target you do not control.
-        log.warning("active tests enabled — sending crafted input to owned target",
-                    extra={"host": host})
 
         # 1. Fetch the page to discover its inputs.
         try:

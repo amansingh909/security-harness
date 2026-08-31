@@ -18,6 +18,11 @@ class Program(BaseModel):
     cve_index_url: str | None = None
     requests_per_second: float = 2.0
     allow_multilevel_wildcard: bool = True
+    # Active testing — OWNED ASSETS ONLY, per program so it can never be a
+    # global switch. active_tests turns on crafted-input probing; use_zap
+    # routes it through OWASP ZAP (creds come from the environment).
+    active_tests: bool = False
+    use_zap: bool = False
     notes: str = ""
 
     def is_runnable(self) -> tuple[bool, str]:
