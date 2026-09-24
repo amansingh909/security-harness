@@ -151,12 +151,14 @@ def _cmd_import_scope(args: argparse.Namespace) -> None:
             name=name, in_scope=in_scope, out_of_scope=out_of_scope,
             seeds=seeds, seeds_file=None,
             cve_index_url=args.cve_index_url,
+            h1_handle=(None if args.file else args.handle),
         ))
         print(f"\ncreated program {name!r} with {len(seeds)} seed(s)")
     else:
         # Only the scope is refreshed; seeds and tuning stay as the user set them.
         updated = existing.model_copy(update={
             "in_scope": in_scope, "out_of_scope": out_of_scope,
+            **({} if args.file else {"h1_handle": args.handle}),
         })
         reg.add(updated)
         print(f"\nupdated scope for existing program {name!r} (seeds untouched)")
@@ -746,6 +748,46 @@ def _cmd_seed_practice(args: argparse.Namespace) -> None:
     print("Run `harness auto` to recon and actively test them.")
 
 
+async def _refresh_h1_scopes(registry: Registry, names: list[str]) -> None:
+    """Re-pull each HackerOne-imported program's scope from the API before a run.
+
+    Keeps the autonomous runner from working off stale scope. Programs not
+    imported from HackerOne (no ``h1_handle``) are left alone; a fetch failure
+    keeps the saved scope rather than crashing the run; a no-op without creds.
+    """
+    identifier = os.getenv("H1_IDENTIFIER")
+    token = os.getenv("H1_API_KEY")
+    if not identifier or not token:
+        return
+    try:
+        from recon_orchestrator import hackerone_scope
+    except ImportError:
+        return
+
+    changed = False
+    for name in names:
+        program = registry.get(name)
+        if program is None or not program.h1_handle:
+            continue
+        try:
+            in_scope, out_scope = await hackerone_scope.fetch_structured_scopes(
+                program.h1_handle, identifier, token
+            )
+        except Exception as exc:  # noqa: BLE001 - keep saved scope on any failure
+            print(f"  ⚠️  scope refresh failed for {name!r}: {exc}; using saved scope")
+            continue
+        if in_scope and (in_scope != program.in_scope
+                         or out_scope != program.out_of_scope):
+            registry.add(program.model_copy(update={
+                "in_scope": in_scope, "out_of_scope": out_scope,
+            }))
+            changed = True
+            print(f"  ↻ {name}: scope refreshed from HackerOne "
+                  f"({len(in_scope)} in, {len(out_scope)} out)")
+    if changed:
+        registry.save(programs_file())
+
+
 def _arm_for_mode(program: Program) -> Program:
     """Force active testing on for practice targets and off for real programs.
 
@@ -786,6 +828,9 @@ def _cmd_auto(args: argparse.Namespace) -> None:
             print("no programs to run — check the names, or add one with "
                   "`harness add-prog NAME SCOPE SEEDS`.")
             return
+        # Pull fresh scope from HackerOne for imported programs first, so a run
+        # never works off a stale copy.
+        asyncio.run(_refresh_h1_scopes(registry, names))
         # Enforce the bright line before any recon: real programs go passive,
         # practice programs arm the active engine.
         for name in names:

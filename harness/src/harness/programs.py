@@ -28,6 +28,9 @@ class Program(BaseModel):
     # traffic (real in-scope programs). "practice" = arm the active engine, for
     # intentionally-vulnerable practice targets you own or are meant to exploit.
     mode: Literal["real", "practice"] = "real"
+    # Set when imported from HackerOne, so `harness auto` can re-pull fresh scope
+    # before each run instead of working off a stale copy.
+    h1_handle: str | None = None
     notes: str = ""
 
     def is_runnable(self) -> tuple[bool, str]:

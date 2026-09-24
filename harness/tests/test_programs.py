@@ -47,6 +47,11 @@ def test_program_mode_defaults_to_real():
     assert Program(name="x").mode == "real"
 
 
+def test_program_h1_handle_defaults_to_none():
+    """Only programs imported from HackerOne carry a handle to refresh from."""
+    assert Program(name="x").h1_handle is None
+
+
 def test_program_mode_roundtrips_through_yaml(tmp_path):
     reg = Registry()
     reg.add(Program(name="lab", in_scope=["localhost"], seeds=["localhost"],

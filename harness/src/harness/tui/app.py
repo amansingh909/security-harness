@@ -771,11 +771,13 @@ class HarnessApp(App[None]):
                 name=program_handle, in_scope=in_scope, out_of_scope=out_scope,
                 seeds=seeds, seeds_file=None, cve_index_url=DEFAULT_CVE_URL,
                 active_tests=active_tests, use_zap=use_zap,
+                h1_handle=program_handle,
             ))
             verb = f"created with {len(seeds)} seed(s)"
         else:
             self.registry.add(existing.model_copy(update={
                 "in_scope": in_scope, "out_of_scope": out_scope,
+                "h1_handle": program_handle,
             }))
             verb = "scope refreshed (seeds kept)"
 

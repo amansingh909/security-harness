@@ -458,6 +458,94 @@ def test_auto_runs_only_the_requested_programs(tmp_path, monkeypatch):
     assert ran == ["a"]  # only the requested program, not b
 
 
+# --- auto-refresh HackerOne scope so a run never uses stale scope -------------
+
+def test_refresh_h1_scopes_updates_imported_program_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("H1_IDENTIFIER", "id")
+    monkeypatch.setenv("H1_API_KEY", "key")
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="acme", in_scope=["old.acme.com"], seeds=["old.acme.com"],
+                    h1_handle="acme"))
+    reg.add(Program(name="manual", in_scope=["m.com"], seeds=["m.com"]))  # no handle
+
+    import recon_orchestrator.hackerone_scope as h1
+
+    async def fake_fetch(handle, identifier, token, **k):
+        assert (handle, identifier, token) == ("acme", "id", "key")
+        return (["*.acme.com", "api.acme.com"], ["admin.acme.com"])
+    monkeypatch.setattr(h1, "fetch_structured_scopes", fake_fetch)
+
+    asyncio.run(cli._refresh_h1_scopes(reg, ["acme", "manual"]))
+
+    acme = reg.get("acme")
+    assert acme.in_scope == ["*.acme.com", "api.acme.com"]  # refreshed from H1
+    assert acme.out_of_scope == ["admin.acme.com"]
+    assert reg.get("manual").in_scope == ["m.com"]          # no handle -> untouched
+
+
+def test_refresh_h1_scopes_keeps_saved_scope_on_failure(monkeypatch):
+    monkeypatch.setenv("H1_IDENTIFIER", "id")
+    monkeypatch.setenv("H1_API_KEY", "key")
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="acme", in_scope=["saved.acme.com"], h1_handle="acme"))
+
+    import recon_orchestrator.hackerone_scope as h1
+
+    async def boom(handle, identifier, token, **k):
+        raise RuntimeError("api down")
+    monkeypatch.setattr(h1, "fetch_structured_scopes", boom)
+
+    asyncio.run(cli._refresh_h1_scopes(reg, ["acme"]))
+    assert reg.get("acme").in_scope == ["saved.acme.com"]   # kept, no crash
+
+
+def test_refresh_h1_scopes_without_creds_is_noop(monkeypatch):
+    monkeypatch.delenv("H1_IDENTIFIER", raising=False)
+    monkeypatch.delenv("H1_API_KEY", raising=False)
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="acme", in_scope=["saved"], h1_handle="acme"))
+
+    import recon_orchestrator.hackerone_scope as h1
+
+    async def boom(*a, **k):
+        raise AssertionError("must not hit the API without credentials")
+    monkeypatch.setattr(h1, "fetch_structured_scopes", boom)
+
+    asyncio.run(cli._refresh_h1_scopes(reg, ["acme"]))
+    assert reg.get("acme").in_scope == ["saved"]
+
+
+def test_auto_refreshes_h1_scope_before_the_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="p", in_scope=["p.com"], seeds=["p.com"], h1_handle="p"))
+    reg.save(tmp_path / "programs.yaml")
+
+    async def _ok(*a, **k):
+        return None
+    monkeypatch.setattr(cli, "_ensure_cve_index_running", _ok)
+    monkeypatch.setattr(cli, "_ensure_cve_corpus", _ok)
+    monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
+
+    order: list[str] = []
+
+    async def fake_refresh(registry, names):
+        order.append("refresh")
+
+    async def fake_pipeline(registry, names):
+        order.append("pipeline")
+    monkeypatch.setattr(cli, "_refresh_h1_scopes", fake_refresh)
+    monkeypatch.setattr(cli, "_run_pipeline", fake_pipeline)
+
+    cli._cmd_auto(argparse.Namespace())
+    assert order == ["refresh", "pipeline"]  # scope refreshed BEFORE recon
+
+
 # --- seed the practice targets ------------------------------------------------
 
 def test_seed_practice_adds_the_vulnweb_program(tmp_path, monkeypatch):
