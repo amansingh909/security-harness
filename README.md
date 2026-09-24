@@ -90,19 +90,25 @@ cve-index ingest --mode full         # fetch → embed → index → alias-swap 
 cve-index serve                      # http://localhost:8080
 ```
 
-### 2. Seed practice targets and run headless
+### 2. Add programs and run headless
 
 ```bash
 harness seed-practice                # adds the vulnweb practice program (mode=practice)
+harness import-scope <handle>        # pull a real HackerOne program's scope (or press `i` in the TUI)
 harness auto                         # recon + scan every program, fill the review queue
 harness auto --programs vulnweb      # or scope a run to a subset
 ```
 
 `harness auto` is non-interactive — no TUI, no prompts, **no upload** — so it is
-safe to run from cron or an agent. It starts the services, ingests the CVE corpus
-once if the index is empty, runs each program **in its mode** (real → passive,
-practice → active engine), and writes per-finding records to
-`~/hunts/<program>/findings/`.
+safe to run from cron or an agent. It **refreshes every HackerOne-imported
+program's scope from the API first** (so a run never works off a stale copy),
+starts the services, ingests the CVE corpus once if the index is empty, runs each
+program **in its mode** (real → passive GET/HEAD, practice → active engine), and
+writes per-finding records to `~/hunts/<program>/findings/`.
+
+> A real HackerOne program is imported **passive** (real mode). Only add one you
+> may actually scan: check the program's automation policy — an asset can be in
+> scope while automated scanning is against that program's rules.
 
 ### 3. Review and submit in the TUI
 

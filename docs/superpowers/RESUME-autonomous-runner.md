@@ -42,6 +42,11 @@ pass; it now builds from the recon leads, where the signals actually live
   persists on the record (`evidence` field + `set_evidence`) and survives re-scans.
 - ✅ **Humanizer verified live via freeclaude** and fixed: it leaked a
   `freellmapi router…` line + a terminal-escape onto stdout; `_clean` strips them.
+- ✅ **Scope auto-refresh:** `Program.h1_handle` (set at import via the TUI `i`
+  prompt / `harness import-scope`); `harness auto` re-pulls each imported
+  program's scope from the HackerOne API before running, so it never works off a
+  stale copy. Graceful on failure, no-op without creds. Closes the "autonomous
+  without failing on scope" loop.
 
 ### Still to do
 - **Hermes/sandbox deploy:** `git pull` into `~/pi/sand`, schedule `harness auto`.
