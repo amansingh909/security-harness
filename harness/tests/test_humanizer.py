@@ -37,6 +37,20 @@ def test_humanize_sends_the_text_and_the_rules_to_the_backend(monkeypatch):
     assert "human" in seen["prompt"].lower()  # the de-AI rules are included
 
 
+def test_clean_strips_freeclaude_preamble_and_escape_sequences():
+    """freeclaude leaks a router status line and a terminal-title escape onto
+    stdout; neither may end up in the humanized report."""
+    raw = (
+        "freellmapi router already running — leaving it up on exit\n"
+        "\x1b]0;freeclaude\x07\n"
+        "\n"
+        "This vulnerability lets an attacker read any invoice by id."
+    )
+    assert humanizer._clean(raw) == (
+        "This vulnerability lets an attacker read any invoice by id."
+    )
+
+
 def test_humanize_default_backend_is_freeclaude(monkeypatch):
     captured = {}
 

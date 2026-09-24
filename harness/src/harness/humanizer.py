@@ -10,6 +10,7 @@ generation never breaks on a missing or slow model.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 # Condensed from the humanizer skill (Wikipedia "signs of AI writing"). The
@@ -28,6 +29,17 @@ TEXT:
 """
 
 
+# freeclaude (Claude Code) can emit ANSI/OSC control sequences and a router
+# status line on stdout; strip them so only the model's text reaches the report.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _clean(text: str) -> str:
+    text = _ANSI.sub("", text)
+    lines = [line for line in text.splitlines() if "freellmapi router" not in line]
+    return "\n".join(lines).strip()
+
+
 def _default_cmd() -> str:
     """The humanizer backend command: the operator's freeclaude if present."""
     local = os.path.expanduser("~/.local/bin/freeclaude")
@@ -44,7 +56,7 @@ def _run_backend(prompt: str, cmd: str, timeout: float) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"{cmd} exited {result.returncode}: {result.stderr[:200]}")
-    return result.stdout.strip()
+    return _clean(result.stdout)
 
 
 def humanize(text: str, *, cmd: str | None = None, timeout: float = 120.0) -> str:
