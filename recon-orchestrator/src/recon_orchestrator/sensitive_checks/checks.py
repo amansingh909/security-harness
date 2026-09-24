@@ -105,7 +105,8 @@ async def check_sensitive_paths(
         # the server saying the file is NOT there. Following it turns every
         # path into a false "exposed" hit on the login page.
         async with httpx.AsyncClient(
-            headers={"User-Agent": settings.user_agent},
+            headers={"User-Agent": settings.user_agent,
+                     **(settings.extra_request_headers or {})},
             timeout=timeout,
             limits=limits,
             verify=settings.verify_tls,
@@ -256,7 +257,8 @@ async def run_sensitive_checks(
         timeout = httpx.Timeout(settings.http_timeout, connect=settings.connect_timeout)
 
         async with httpx.AsyncClient(
-            headers={"User-Agent": settings.user_agent},
+            headers={"User-Agent": settings.user_agent,
+                     **(settings.extra_request_headers or {})},
             timeout=timeout,
             limits=limits,
             verify=settings.verify_tls,

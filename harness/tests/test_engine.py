@@ -48,6 +48,51 @@ def test_available_reports_components():
     assert all(isinstance(v, bool) for v in avail.values())
 
 
+# --- required testing headers must ride EVERY request to a target -------------
+#
+# Programs like HackerOne's CLEAR require a header (X-Bug-Bounty: HackerOne-<user>)
+# on all traffic or the reward is forfeited. Both the recon prober and the
+# separate scan/fingerprint client must carry it.
+
+def test_run_recon_puts_program_extra_headers_on_the_probe(monkeypatch):
+    import recon_orchestrator.orchestrator as orch
+    captured = {}
+
+    async def fake_run(settings, scope, seeds):
+        captured["headers"] = dict(settings.extra_request_headers or {})
+        return []
+    monkeypatch.setattr(orch, "run_recon", fake_run)
+
+    from harness.programs import Program
+    prog = Program(name="clear", in_scope=["*.clearme.com"], seeds=["clearme.com"],
+                   extra_headers={"X-Bug-Bounty": "HackerOne-88yk"})
+    import asyncio
+    asyncio.run(engine.run_recon(prog))
+    assert captured["headers"].get("X-Bug-Bounty") == "HackerOne-88yk"
+
+
+def test_scan_for_vulns_client_carries_extra_headers(monkeypatch):
+    import httpx
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            captured["headers"] = dict(k.get("headers") or {})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    from harness.programs import Program
+    prog = Program(name="clear", extra_headers={"X-Bug-Bounty": "HackerOne-88yk"})
+    import asyncio
+    asyncio.run(engine.scan_for_vulns(prog, []))  # empty leads: client made, loop skipped
+    assert captured["headers"].get("X-Bug-Bounty") == "HackerOne-88yk"
+
+
 def test_draft_report_humanizes_prose_but_leaves_evidence(monkeypatch):
     pytest.importorskip("bounty_reporter")
     import harness.humanizer as hz

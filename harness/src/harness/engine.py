@@ -16,6 +16,24 @@ class ComponentMissing(RuntimeError):
     """A required sibling component isn't importable/installed."""
 
 
+def _target_headers(program: Program) -> dict[str, str]:
+    """Headers to put on EVERY request to a program's assets.
+
+    Program-required testing headers (e.g. ``X-Bug-Bounty``) plus the Vercel
+    protection-bypass header when configured. A program that requires a header
+    forfeits the reward if any request is missing it, so both the recon prober
+    and the separate scan/fingerprint client build their headers from here.
+    """
+    import os
+
+    headers: dict[str, str] = dict(program.extra_headers or {})
+    bypass = os.getenv("VERCEL_AUTOMATION_BYPASS_SECRET")
+    if bypass:
+        headers["x-vercel-protection-bypass"] = bypass
+        headers["x-vercel-set-bypass-cookie"] = "true"
+    return headers
+
+
 async def run_recon(program: Program) -> list[dict]:
     """Run recon for a program via recon_orchestrator; return candidate leads."""
     try:
@@ -40,13 +58,9 @@ async def run_recon(program: Program) -> list[dict]:
             raise ComponentMissing(f"seeds_file unreadable: {exc}") from exc
 
     import os
-    # A Vercel protection-bypass secret (env) lets a scan reach a protected
-    # preview; sent as the header Vercel checks, on every request.
-    extra_headers: dict[str, str] = {}
-    bypass = os.getenv("VERCEL_AUTOMATION_BYPASS_SECRET")
-    if bypass:
-        extra_headers["x-vercel-protection-bypass"] = bypass
-        extra_headers["x-vercel-set-bypass-cookie"] = "true"
+
+    # Program-required testing headers + any Vercel bypass, on every request.
+    extra_headers = _target_headers(program)
     settings = Settings(
         requests_per_second=program.requests_per_second,
         cve_index_url=program.cve_index_url,
@@ -250,8 +264,11 @@ async def scan_for_vulns(program: Program, leads: list[dict]) -> list[dict]:
 
     vulns = []
 
-    # Use a reasonable timeout and limit concurrent requests
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # Use a reasonable timeout and limit concurrent requests. The scan step has
+    # its own client, so it must carry the program's required headers too.
+    async with httpx.AsyncClient(
+        timeout=10.0, headers=_target_headers(program)
+    ) as client:
         for lead in leads:
             host = lead.get("host")
             if not host:

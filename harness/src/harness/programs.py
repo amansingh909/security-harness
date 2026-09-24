@@ -31,6 +31,10 @@ class Program(BaseModel):
     # Set when imported from HackerOne, so `harness auto` can re-pull fresh scope
     # before each run instead of working off a stale copy.
     h1_handle: str | None = None
+    # Headers put on EVERY request to this program's assets (e.g. a program's
+    # required testing header like `X-Bug-Bounty: HackerOne-<user>`). A program
+    # that requires one forfeits the reward if any request is missing it.
+    extra_headers: dict[str, str] = Field(default_factory=dict)
     notes: str = ""
 
     def is_runnable(self) -> tuple[bool, str]:

@@ -52,6 +52,11 @@ def test_program_h1_handle_defaults_to_none():
     assert Program(name="x").h1_handle is None
 
 
+def test_program_extra_headers_default_empty():
+    """Per-program headers (e.g. a program's required testing header) start empty."""
+    assert Program(name="x").extra_headers == {}
+
+
 def test_program_mode_roundtrips_through_yaml(tmp_path):
     reg = Registry()
     reg.add(Program(name="lab", in_scope=["localhost"], seeds=["localhost"],

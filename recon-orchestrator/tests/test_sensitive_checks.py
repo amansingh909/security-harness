@@ -18,6 +18,40 @@ from recon_orchestrator.config import Settings
 from recon_orchestrator.models import HostProbe
 
 
+def test_sensitive_checks_carry_extra_request_headers(monkeypatch):
+    """A program-required header (e.g. X-Bug-Bounty) must ride the sensitive-path
+    client too, not just the shared prober."""
+    import recon_orchestrator.sensitive_checks.checks as checks
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 404
+        text = ""
+        headers = {}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            captured["headers"] = k.get("headers")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return FakeResp()
+
+        async def head(self, *a, **k):
+            return FakeResp()
+
+    monkeypatch.setattr(checks.httpx, "AsyncClient", FakeClient)
+    s = Settings(extra_request_headers={"X-Bug-Bounty": "HackerOne-88yk"})
+    asyncio.run(checks.check_sensitive_paths("h.example.com", s, ports=[443]))
+    assert captured["headers"].get("X-Bug-Bounty") == "HackerOne-88yk"
+
+
 def test_check_cors_misconfiguration():
     """Test CORS misconfiguration detection."""
     # Test wildcard origin
