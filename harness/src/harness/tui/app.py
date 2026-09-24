@@ -23,8 +23,9 @@ import os
 
 from rich.text import Text
 
-from .. import engine, store
+from .. import engine, findings_store, store
 from ..findings import finding_template
+from ..findings_store import FindingRecord
 from ..paths import ensure_dirs, hunts_dir, programs_file
 from ..programs import Program, Registry
 
@@ -298,6 +299,111 @@ class TriageScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+def _status_cell(status: str) -> Text:
+    """Colour a finding's status so the review queue reads as a worklist."""
+    styles = {
+        "needs_check": "bold yellow",
+        "ready": "bold green",
+        "real": "bold red",
+        "false": "dim",
+        "duplicate": "dim",
+    }
+    return Text(status, style=styles.get(status, ""))
+
+
+def collect_findings(registry: Registry) -> list[FindingRecord]:
+    """Every stored finding across all programs, ordered as a triage worklist.
+
+    A fresh finding still needing a human sits at the top; one already ruled
+    real / false / duplicate sinks below it. Within a status, higher priority
+    comes first.
+    """
+    out: list[FindingRecord] = []
+    for prog_name in registry.names():
+        out.extend(findings_store.load_findings(prog_name))
+    order = {"needs_check": 0, "ready": 1, "real": 2, "duplicate": 3, "false": 4}
+    out.sort(key=lambda r: (order.get(r.status, 9), -r.priority_score))
+    return out
+
+
+class FindingsScreen(ModalScreen[None]):
+    """The review queue: every finding across all programs, marked in place.
+
+    r / f / x mark the highlighted finding real / false / duplicate and persist
+    immediately; escape or q closes. The autonomous runner fills this queue; the
+    operator works it here instead of editing files.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("q", "cancel", "Close"),
+        Binding("r", "mark_real", "Real"),
+        Binding("f", "mark_false", "False"),
+        Binding("x", "mark_duplicate", "Dup"),
+    ]
+
+    def __init__(self, registry: Registry) -> None:
+        super().__init__()
+        self.registry = registry
+        self._ordered: list[tuple[str, str]] = []  # row index -> (program, finding id)
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield DataTable(id="findings-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        table.add_columns("Program", "Status", "Score", "Host:Port", "Service", "CVEs")
+        self._populate_table()
+
+    def _populate_table(self) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        table.clear()
+        self._ordered = []
+        for record in collect_findings(self.registry):
+            service = record.service or {}
+            host = record.host or service.get("host", "")
+            port = service.get("port", "")
+            hostport = f"{host}:{port}" if port else host
+            scheme = service.get("scheme", "")
+            service_desc = (
+                f"{scheme.upper()} {service.get('server', '')} "
+                f"{service.get('powered_by', '')}"
+            ).strip()
+            self._ordered.append((record.program, record.id))
+            table.add_row(
+                record.program,
+                _status_cell(record.status),
+                _score_cell(record.priority_score),
+                hostport,
+                service_desc,
+                str(len(record.cves)),
+                key=record.id,
+            )
+
+    def _mark(self, status: str) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        idx = table.cursor_row
+        if idx is None or idx < 0 or idx >= len(self._ordered):
+            return
+        program, fid = self._ordered[idx]
+        findings_store.update_status(program, fid, status)
+        self._populate_table()
+
+    def action_mark_real(self) -> None:
+        self._mark("real")
+
+    def action_mark_false(self) -> None:
+        self._mark("false")
+
+    def action_mark_duplicate(self) -> None:
+        self._mark("duplicate")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HarnessApp(App[None]):
     CSS_PATH = "app.tcss"
     TITLE = "security-harness"
@@ -308,6 +414,7 @@ class HarnessApp(App[None]):
         Binding("r", "recon", "Recon"),
         Binding("v", "scan", "Scan"),
         Binding("t", "triage", "Triage"),
+        Binding("f", "findings", "Findings"),
         Binding("u", "upload", "Upload"),
         Binding("a", "add", "Add"),
         Binding("question_mark", "help", "Help", key_display="?"),
@@ -358,6 +465,10 @@ class HarnessApp(App[None]):
         # leaves the modal on top while focus stays on the main screen.
         if os.environ.pop("HARNESS_AUTO_OPEN_TRIAGE", None) == "1":
             self.call_after_refresh(lambda: self.push_screen(TriageScreen(self.registry)))
+
+    def action_findings(self) -> None:
+        """Open the review queue: every finding across all programs."""
+        self.push_screen(FindingsScreen(self.registry))
 
     # ---- component status bar -----------------------------------------
     def _cve_url(self) -> str:
