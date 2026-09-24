@@ -34,12 +34,19 @@ pass; it now builds from the recon leads, where the signals actually live
   (testphp/testasp/testaspnet/testhtml5/rest.vulnweb.com) as one `mode=practice`
   program — already run into `~/.harness/programs.yaml`.
 
+### DONE since
+- ✅ **In-TUI submit flow:** Enter on a finding → `FindingDetailScreen` (shows what
+  recon saw, takes operator-verified evidence) → Ctrl+D previews the humanized
+  report (`engine.draft_report`) → Ctrl+S submits with a two-step confirm
+  (`engine.submit_finding`, refuses missing evidence, needs API keys). Evidence
+  persists on the record (`evidence` field + `set_evidence`) and survives re-scans.
+- ✅ **Humanizer verified live via freeclaude** and fixed: it leaked a
+  `freellmapi router…` line + a terminal-escape onto stdout; `_clean` strips them.
+
 ### Still to do
-- **In-TUI submit flow:** open a finding → view its drafted (humanized) report →
-  submit with a confirm (the only thing that POSTs). Real-program leads need an
-  evidence-entry step first; practice findings carry active-engine evidence.
-  Building blocks are in place: `engine.draft_report` + the neutered uploader.
 - **Hermes/sandbox deploy:** `git pull` into `~/pi/sand`, schedule `harness auto`.
+- Optional polish: evidence-entry could pre-fill from the recon signals; the
+  detail screen's Ctrl+S re-humanizes on submit (one extra freeclaude call).
 
 ### Note for whoever runs `harness auto`
 The user has real programs in `~/.harness/programs.yaml` (`trazo`, a Vercel
