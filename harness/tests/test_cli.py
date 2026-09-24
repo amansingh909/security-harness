@@ -289,3 +289,50 @@ def test_ensure_cve_index_starts_server_without_poetry(tmp_path, monkeypatch):
     assert captured["argv"][0] == sys.executable
     assert captured["argv"][1:3] == ["-m", "cve_index"]
     assert "serve" in captured["argv"]
+
+
+# --- startup: ingest the CVE corpus once if it's empty ------------------------
+#
+# global/auto never populated Elasticsearch, so every vuln lookup returned
+# nothing and every report came back empty. The runner must ingest on a cold
+# index (vectors == 0) and skip when data is already present.
+
+def test_cve_corpus_is_populated_reads_vector_count():
+    assert cli._cve_corpus_is_populated({"up": True, "vectors": 1200}) is True
+    assert cli._cve_corpus_is_populated({"up": True, "vectors": 0}) is False
+    assert cli._cve_corpus_is_populated({"up": False, "vectors": None}) is False
+
+
+def test_ensure_cve_corpus_skips_ingest_when_populated(monkeypatch):
+    async def health(url):
+        return {"up": True, "vectors": 5000}
+    monkeypatch.setattr(cli.engine, "cve_index_health", health)
+
+    def no_run(*a, **k):
+        raise AssertionError("must not ingest when the index already has data")
+    monkeypatch.setattr(cli.subprocess, "run", no_run)
+
+    asyncio.run(cli._ensure_cve_corpus())
+
+
+def test_ensure_cve_corpus_ingests_full_when_empty(monkeypatch):
+    async def health(url):
+        return {"up": True, "vectors": 0}
+    monkeypatch.setattr(cli.engine, "cve_index_health", health)
+
+    captured: dict = {}
+
+    class OK:
+        returncode = 0
+
+    def fake_run(argv, *a, **k):
+        captured["argv"] = list(argv)
+        return OK()
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    asyncio.run(cli._ensure_cve_corpus())
+
+    assert captured["argv"][0] == sys.executable
+    assert captured["argv"][1:3] == ["-m", "cve_index"]
+    assert "ingest" in captured["argv"]
+    assert "--mode" in captured["argv"] and "full" in captured["argv"]

@@ -518,6 +518,41 @@ async def _ensure_cve_index_running() -> None:
     raise RuntimeError("cve-index service did not become healthy within 30s")
 
 
+def _cve_corpus_is_populated(health: dict) -> bool:
+    """True when the CVE index actually holds vectors to search.
+
+    `engine.cve_index_health` returns {"up": bool, "vectors": int | None}; a
+    freshly-started stack answers healthy but with vectors == 0 — the "no data
+    yet" state the runner must ingest out of before any scan can find anything.
+    """
+    return bool(health.get("vectors"))
+
+
+async def _ensure_cve_corpus() -> None:
+    """Ingest the CVE corpus once if the index is empty; otherwise leave it.
+
+    Without this, global/auto scanned against an empty index — every lookup
+    returned nothing and every report came back empty. The first run pulls
+    NVD + ATT&CK (bounded by CVE_NVD_MAX_RECORDS); later runs find data and skip.
+    """
+    health = await engine.cve_index_health("http://localhost:8080")
+    if _cve_corpus_is_populated(health):
+        return
+    print(
+        "→ CVE index is empty — running a first ingest (this can take a while)…",
+        flush=True,
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "cve_index", "ingest", "--mode", "full"],
+        cwd=_cve_index_dir(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"cve-index ingest failed (exit {result.returncode}); run it "
+            "directly to see the error."
+        )
+
+
 async def _run_pipeline(registry: Registry, names: list[str]) -> None:
     """Recon + vuln scan for every program, in a single event loop.
 
