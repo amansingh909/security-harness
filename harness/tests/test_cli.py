@@ -96,7 +96,7 @@ def test_every_subcommand_handler_exists():
     import time, but a renamed one only fails when that command is run."""
     for handler in ("_cmd_tui", "_cmd_list", "_cmd_add", "_cmd_add_prog",
                     "_cmd_hunt", "_cmd_scan", "_cmd_global", "_cmd_up",
-                    "_cmd_down", "_cmd_auto"):
+                    "_cmd_down", "_cmd_auto", "_cmd_seed_practice"):
         assert callable(getattr(cli, handler, None)), f"{handler} missing"
 
 
@@ -429,3 +429,35 @@ def test_auto_arms_programs_by_mode_before_the_pipeline(tmp_path, monkeypatch):
 
     assert seen["realp"] is False   # real forced passive before any recon
     assert seen["pract"] is True    # practice armed
+
+
+# --- seed the practice targets ------------------------------------------------
+
+def test_seed_practice_adds_the_vulnweb_program(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    from harness.programs import Registry
+
+    cli._cmd_seed_practice(argparse.Namespace())
+
+    reg = Registry.load(tmp_path / "programs.yaml")
+    assert "vulnweb" in reg.names()
+    vw = reg.get("vulnweb")
+    assert vw.mode == "practice"
+    assert len(vw.seeds) >= 3          # "at least 3" different sites
+    assert "testphp.vulnweb.com" in vw.seeds
+
+
+def test_seed_practice_is_idempotent_and_keeps_existing_programs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    from harness.programs import Program, Registry
+
+    reg = Registry()
+    reg.add(Program(name="mine", in_scope=["*.mine.com"], seeds=["mine.com"]))
+    reg.save(tmp_path / "programs.yaml")
+
+    cli._cmd_seed_practice(argparse.Namespace())
+    cli._cmd_seed_practice(argparse.Namespace())  # second run must not duplicate/crash
+
+    reg = Registry.load(tmp_path / "programs.yaml")
+    assert "mine" in reg.names()               # existing program untouched
+    assert reg.names().count("vulnweb") == 1   # added once, not duplicated

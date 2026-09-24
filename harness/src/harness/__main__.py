@@ -705,6 +705,47 @@ def _offer_service_teardown() -> None:
         print("   left running — `harness down` stops everything.")
 
 
+def _practice_programs() -> list[Program]:
+    """The default practice targets: public, intentionally-vulnerable test sites.
+
+    The Acunetix vulnweb family exists specifically for exercising security
+    tools, so autonomous active testing against them is their intended use.
+    Returns fresh instances so callers may mutate them freely.
+    """
+    return [
+        Program(
+            name="vulnweb",
+            in_scope=["*.vulnweb.com"],
+            seeds=[
+                "testphp.vulnweb.com",
+                "testasp.vulnweb.com",
+                "testaspnet.vulnweb.com",
+                "testhtml5.vulnweb.com",
+                "rest.vulnweb.com",
+            ],
+            mode="practice",
+            notes="Acunetix public, intentionally-vulnerable test sites.",
+        ),
+    ]
+
+
+def _cmd_seed_practice(args: argparse.Namespace) -> None:
+    """Add the default practice programs (idempotent), leaving your own alone."""
+    ensure_dirs()
+    registry = Registry.load(programs_file())
+    added: list[str] = []
+    for program in _practice_programs():
+        if registry.get(program.name) is None:
+            registry.add(program)
+            added.append(program.name)
+    registry.save(programs_file())
+    if added:
+        print(f"✅ added practice program(s): {', '.join(added)}")
+    else:
+        print("practice programs already present — nothing to add.")
+    print("Run `harness auto` to recon and actively test them.")
+
+
 def _arm_for_mode(program: Program) -> Program:
     """Force active testing on for practice targets and off for real programs.
 
@@ -814,6 +855,13 @@ def main() -> None:
              "queue (no TUI, no prompts, no upload)",
     )
     p_auto.set_defaults(func=_cmd_auto)
+
+    # ── Seed practice targets ─────────────────────────────────────────────────
+    p_seed = sub.add_parser(
+        "seed-practice",
+        help="add the default practice targets (intentionally-vulnerable test sites)",
+    )
+    p_seed.set_defaults(func=_cmd_seed_practice)
 
     # ── HackerOne scope import ────────────────────────────────────────────────
     p_scope = sub.add_parser(
