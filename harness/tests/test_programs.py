@@ -40,3 +40,17 @@ def test_registry_remove(tmp_path):
     assert reg.remove("acme") is True
     assert reg.remove("acme") is False
     assert reg.names() == []
+
+
+def test_program_mode_defaults_to_real():
+    """A program is passive-only ('real') unless explicitly set to 'practice'."""
+    assert Program(name="x").mode == "real"
+
+
+def test_program_mode_roundtrips_through_yaml(tmp_path):
+    reg = Registry()
+    reg.add(Program(name="lab", in_scope=["localhost"], seeds=["localhost"],
+                    mode="practice"))
+    path = tmp_path / "programs.yaml"
+    reg.save(path)
+    assert Registry.load(path).get("lab").mode == "practice"

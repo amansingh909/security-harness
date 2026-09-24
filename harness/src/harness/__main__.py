@@ -705,6 +705,18 @@ def _offer_service_teardown() -> None:
         print("   left running — `harness down` stops everything.")
 
 
+def _arm_for_mode(program: Program) -> Program:
+    """Force active testing on for practice targets and off for real programs.
+
+    The bright line: in an autonomous run a real in-scope program is passive
+    (GET/HEAD) — it never sends attack traffic, whatever its stored active_tests
+    flag says. A practice program (an intentionally-vulnerable target) arms the
+    active engine. Returns the same program, mutated.
+    """
+    program.active_tests = program.mode == "practice"
+    return program
+
+
 def _cmd_auto(args: argparse.Namespace) -> None:
     """Headless autonomous run: recon + scan for every program, fill the queue.
 
@@ -728,6 +740,10 @@ def _cmd_auto(args: argparse.Namespace) -> None:
         if not names:
             print("no programs defined — add one with `harness add-prog NAME SCOPE SEEDS`.")
             return
+        # Enforce the bright line before any recon: real programs go passive,
+        # practice programs arm the active engine.
+        for name in names:
+            _arm_for_mode(registry.get(name))
         asyncio.run(_run_pipeline(registry, names))
 
         total = 0

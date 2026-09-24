@@ -4,6 +4,7 @@ Persisted as YAML so it's human-editable outside the TUI too."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -23,6 +24,10 @@ class Program(BaseModel):
     # routes it through OWASP ZAP (creds come from the environment).
     active_tests: bool = False
     use_zap: bool = False
+    # Autonomous run mode. "real" = passive GET/HEAD recon only, never attack
+    # traffic (real in-scope programs). "practice" = arm the active engine, for
+    # intentionally-vulnerable practice targets you own or are meant to exploit.
+    mode: Literal["real", "practice"] = "real"
     notes: str = ""
 
     def is_runnable(self) -> tuple[bool, str]:

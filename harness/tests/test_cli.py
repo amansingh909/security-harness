@@ -381,3 +381,51 @@ def test_cmd_auto_fills_review_queue_without_prompts(tmp_path, monkeypatch):
     assert [r.host for r in recs] == ["dev.acme.com"]
     assert recs[0].status == "needs_check"
     assert recs[0].cves[0]["id"] == "CVE-2021-1"
+
+
+# --- practice vs real: the bright line, enforced ------------------------------
+#
+# In an autonomous run a REAL program is always passive (GET/HEAD) — it never
+# sends attack traffic, whatever its stored active_tests flag says. Only a
+# practice program (an intentionally-vulnerable target) arms the active engine.
+
+def test_arm_for_mode_forces_real_passive_and_arms_practice():
+    from harness.programs import Program
+    real = Program(name="r", in_scope=["*.r.com"], seeds=["r.com"],
+                   active_tests=True, mode="real")
+    practice = Program(name="p", in_scope=["localhost"], seeds=["localhost"],
+                       mode="practice")
+    cli._arm_for_mode(real)
+    cli._arm_for_mode(practice)
+    assert real.active_tests is False   # real never active in auto — the bright line
+    assert practice.active_tests is True
+
+
+def test_auto_arms_programs_by_mode_before_the_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="realp", in_scope=["*.r.com"], seeds=["r.com"],
+                    active_tests=True, mode="real"))
+    reg.add(Program(name="pract", in_scope=["localhost"], seeds=["localhost"],
+                    mode="practice"))
+    reg.save(tmp_path / "programs.yaml")
+
+    async def _ok(*a, **k):
+        return None
+    monkeypatch.setattr(cli, "_ensure_cve_index_running", _ok)
+    monkeypatch.setattr(cli, "_ensure_cve_corpus", _ok)
+    monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
+
+    seen: dict = {}
+
+    async def capture_pipeline(registry, names):
+        for name in names:
+            seen[name] = registry.get(name).active_tests
+    monkeypatch.setattr(cli, "_run_pipeline", capture_pipeline)
+
+    cli._cmd_auto(argparse.Namespace())
+
+    assert seen["realp"] is False   # real forced passive before any recon
+    assert seen["pract"] is True    # practice armed
