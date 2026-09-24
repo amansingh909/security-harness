@@ -4,7 +4,7 @@ This document explains how each module in the security-harness maps to real-worl
 
 ## Core Principles
 
-1. **Passive Reconnaissance First**: All modules use GET/HEAD requests only - no payloads, no exploitation attempt
+1. **Mode-Gated Aggression**: A program's mode decides how far the machine goes on its own. `real` targets (live bug-bounty programs) are passive — GET/HEAD only, no payloads, no exploitation. `practice` targets (intentionally-vulnerable sites you own or are meant to exploit) arm the active engine. The default is passive, and a real program is forced passive on every autonomous run.
 2. **Scope-Gated Operations**: Every check respects authorized boundaries via ScopeGuard
 3. **Candidate Generation**: Outputs are leads for manual verification, not vulnerability claims
 4. **Chaining for Context**: Modules build on each other to create a richer picture of the attack surface
@@ -110,7 +110,10 @@ The power comes from combining modules to build a coherent picture:
 
 This mirrors professional penetration testing methodology:
 - Reconnaissance → Vulnerability Identification → Exploitation Attempt → Reporting
-But with critical ethical boundaries: stops at candidate generation, requires manual verification.
+But with critical ethical boundaries: against **real** programs it stops at
+candidate generation and requires manual verification; autonomous **exploitation**
+runs only against **practice** targets that exist to be attacked. A human always
+verifies and submits.
 
 ---
 
@@ -149,7 +152,7 @@ The machine's output is only the beginning. For each candidate lead:
 4. **Professional**: Mirrors how mature security teams operate
 5. **Sustainable**: Can run continuously without noise or legal risk
 
-This is how you build a "money making machine" - not by automating exploitation (which is illegal and unethical), but by automating the hard work of discovery and prioritization so skilled humans can focus on what they do best: creative manual testing and vulnerability chaining.
+This is how you build a sustainable bug-bounty pipeline: automate the hard work — discovery, prioritization, and report drafting — and reserve human judgement for what is real, what pays, and what is legal to do. Against **real** programs the machine never exploits or submits on its own; it surfaces leads, and a human verifies and submits each one from the TUI. Autonomous **exploitation** is confined to **practice** targets that exist to be attacked. That split is what keeps the pipeline both effective and inside the rules.
 
 ---
 

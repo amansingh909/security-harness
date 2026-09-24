@@ -47,3 +47,46 @@ The user wanted a single command (`harness global`) that:
 
 ## Related Files
 - The README already documented the `harness global` command correctly, so no changes were needed there.
+
+---
+
+# Autonomous runner + TUI review/submit (branch: active-test-extension, 2026-09-24)
+
+## Summary
+Turned the harness into a headless autonomous runner with a TUI review/submit
+cockpit, and fixed the blockers that stopped the pipeline from working at all.
+
+## Added
+- **`harness auto`** — non-interactive run (no TUI / prompts / upload): ensures
+  services, ingests the CVE corpus once if empty, runs recon + scan per program,
+  and files per-finding records to `~/hunts/<program>/findings/`. `--programs`
+  scopes it to a subset.
+- **`harness seed-practice`** — seeds the vulnweb practice program (5 sites,
+  `mode=practice`), idempotent.
+- **Program `mode` (`real` | `practice`)** — `_arm_for_mode` forces real programs
+  passive (GET/HEAD) on every autonomous run; only practice programs arm the
+  active engine.
+- **Finding store** (`findings_store.py`) — per-finding records with a mutable
+  status (needs_check / real / false / duplicate) that survives re-scans, plus
+  `signals` / `fingerprints` / `evidence`.
+- **TUI Findings screen** (`f`) — review the queue, mark r/f/x, Enter → a detail
+  screen to add evidence, Ctrl+D draft (humanized), Ctrl+S submit (with confirm).
+- **Humanizer** (`humanizer.py`) — de-AIs report prose via freeclaude
+  (`HARNESS_HUMANIZER_CMD` to override) with a graceful fallback;
+  `engine.draft_report` / `engine.submit_finding` humanize narrative fields only,
+  never the evidence.
+
+## Fixed
+- `_ensure_cve_index_running` launched `poetry run cve-index serve` (no poetry
+  env) → now `python -m cve_index serve`.
+- No CVE ingest step → `_ensure_cve_corpus` ingests when the index is empty.
+- The auto-upload path fabricated evidence and POSTed to real programs → the
+  uploader now refuses unverified leads and never fabricates; submission is a
+  human-only TUI action.
+
+## Verified
+`harness auto --programs vulnweb` ran end to end against the vulnweb family:
+started services, ingested 5,697 vectors, actively found a reflected XSS
+(testasp `/Search.asp?tfSearch`), an exposed `/info.php`, and version
+disclosures, and filed them to the review queue. Humanizer confirmed live via
+freeclaude. 246 unit tests green (harness / recon-orchestrator / bounty-reporter).
