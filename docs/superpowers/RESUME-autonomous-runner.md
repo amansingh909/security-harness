@@ -14,15 +14,29 @@ drafting + humanizer, in-TUI submit.
 5. `feat: TUI Findings screen — review and mark the queue in place` — press `f`.
 6. `fix: uploader refuses to fabricate evidence or submit unverified leads` — the landmine.
 
-### Next up (Milestone 2)
-- **Practice mode:** add a `mode: real|practice` field to `Program`; in `harness
-  auto`, practice programs arm the existing active engine against practice sites,
-  real programs are FORCED passive (the bright line, as a test). *Confirm the
-  practice-target allow-list before arming.*
-- **Report drafting + humanizer:** render a verified finding via the
-  anti-fabrication path, then polish prose with the humanizer (needs an LLM
-  backend — DECIDE: local ollama model vs `freeclaude`).
-- **In-TUI submit:** view the full drafted report, submit with a confirm.
+### Milestone 2 — mostly DONE
+- ✅ **Practice/real mode:** `Program.mode` + `_arm_for_mode`; `harness auto`
+  FORCES real programs passive and arms practice programs (bright line, tested).
+- ✅ **Humanizer:** `harness/humanizer.py` via **freeclaude** (override with
+  `HARNESS_HUMANIZER_CMD`); returns text unchanged if the model is down.
+- ✅ **Report drafting:** `engine.draft_report(finding)` renders a verified
+  finding and humanizes ONLY summary/impact/remediation, never the evidence.
+- ✅ **Practice targets seeded:** `harness seed-practice` adds the vulnweb family
+  (testphp/testasp/testaspnet/testhtml5/rest.vulnweb.com) as one `mode=practice`
+  program — already run into `~/.harness/programs.yaml`.
+
+### Still to do
+- **In-TUI submit flow:** open a finding → view its drafted (humanized) report →
+  submit with a confirm (the only thing that POSTs). Real-program leads need an
+  evidence-entry step first; practice findings carry active-engine evidence.
+  Building blocks are in place: `engine.draft_report` + the neutered uploader.
+- **Hermes/sandbox deploy:** `git pull` into `~/pi/sand`, schedule `harness auto`.
+
+### Note for whoever runs `harness auto`
+The user has real programs in `~/.harness/programs.yaml` (`trazo`, a Vercel
+preview). Auto sweeps them too, but `_arm_for_mode` forces every real-mode
+program **passive** (GET/HEAD) — only `vulnweb` (practice) is actively tested.
+An owned asset the user wants auto to actively test must be set `mode=practice`.
 
 ## Artifacts
 - **Spec (approved):** `docs/superpowers/specs/2026-09-23-autonomous-bounty-runner-design.md`
