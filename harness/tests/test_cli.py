@@ -431,6 +431,31 @@ def test_auto_arms_programs_by_mode_before_the_pipeline(tmp_path, monkeypatch):
     assert seen["pract"] is True    # practice armed
 
 
+def test_auto_runs_only_the_requested_programs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="a", in_scope=["*.a.com"], seeds=["a.com"]))
+    reg.add(Program(name="b", in_scope=["*.b.com"], seeds=["b.com"]))
+    reg.save(tmp_path / "programs.yaml")
+
+    async def _ok(*a, **k):
+        return None
+    monkeypatch.setattr(cli, "_ensure_cve_index_running", _ok)
+    monkeypatch.setattr(cli, "_ensure_cve_corpus", _ok)
+    monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
+
+    ran: list[str] = []
+
+    async def capture(registry, names):
+        ran.extend(names)
+    monkeypatch.setattr(cli, "_run_pipeline", capture)
+
+    cli._cmd_auto(argparse.Namespace(programs="a"))
+    assert ran == ["a"]  # only the requested program, not b
+
+
 # --- seed the practice targets ------------------------------------------------
 
 def test_seed_practice_adds_the_vulnweb_program(tmp_path, monkeypatch):

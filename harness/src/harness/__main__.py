@@ -778,8 +778,13 @@ def _cmd_auto(args: argparse.Namespace) -> None:
     try:
         registry = Registry.load(programs_file())
         names = registry.names()
+        requested = getattr(args, "programs", None)
+        if requested:
+            wanted = {n.strip() for n in requested.split(",") if n.strip()}
+            names = [n for n in names if n in wanted]
         if not names:
-            print("no programs defined — add one with `harness add-prog NAME SCOPE SEEDS`.")
+            print("no programs to run — check the names, or add one with "
+                  "`harness add-prog NAME SCOPE SEEDS`.")
             return
         # Enforce the bright line before any recon: real programs go passive,
         # practice programs arm the active engine.
@@ -853,6 +858,10 @@ def main() -> None:
         "auto",
         help="headless run: recon + scan for all programs and fill the review "
              "queue (no TUI, no prompts, no upload)",
+    )
+    p_auto.add_argument(
+        "--programs",
+        help="comma-separated subset of programs to run (default: all)",
     )
     p_auto.set_defaults(func=_cmd_auto)
 
