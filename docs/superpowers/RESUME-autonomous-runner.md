@@ -1,9 +1,28 @@
 # Resume here — Autonomous Bounty Runner (state @ 2026-09-23)
 
-**Status:** Brainstorm → **spec written & APPROVED**. Next action = write the
-implementation plan (superpowers:writing-plans) for **Milestone 1**, then pick an
-execution method, then build. Interface extraction is already done (no need to
-re-explore).
+**Status:** **Milestone 1 BUILT** — 6 tasks, all committed on branch
+`active-test-extension`, every suite green (harness 67, bounty-reporter 36,
+recon-orchestrator 121). The harness now runs headless and findings are
+reviewable/markable in the TUI. Next: practice-site exploit mode, report
+drafting + humanizer, in-TUI submit.
+
+### Milestone 1 — DONE (each its own commit, authored solely by the user)
+1. `fix: launch cve-index with the venv interpreter, not poetry run` — startup crash.
+2. `feat: ingest the CVE corpus once when the index is empty` — empty-DB / empty-reports.
+3. `feat: per-finding record store with a mutable, review-safe status` — `findings_store.py`.
+4. `feat: harness auto — headless run that fills the review queue` — non-interactive entry.
+5. `feat: TUI Findings screen — review and mark the queue in place` — press `f`.
+6. `fix: uploader refuses to fabricate evidence or submit unverified leads` — the landmine.
+
+### Next up (Milestone 2)
+- **Practice mode:** add a `mode: real|practice` field to `Program`; in `harness
+  auto`, practice programs arm the existing active engine against practice sites,
+  real programs are FORCED passive (the bright line, as a test). *Confirm the
+  practice-target allow-list before arming.*
+- **Report drafting + humanizer:** render a verified finding via the
+  anti-fabrication path, then polish prose with the humanizer (needs an LLM
+  backend — DECIDE: local ollama model vs `freeclaude`).
+- **In-TUI submit:** view the full drafted report, submit with a confirm.
 
 ## Artifacts
 - **Spec (approved):** `docs/superpowers/specs/2026-09-23-autonomous-bounty-runner-design.md`
