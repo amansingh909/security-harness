@@ -21,7 +21,7 @@ import time
 from getpass import getpass
 from pathlib import Path
 
-from . import engine, store
+from . import engine, findings_store, store
 from .paths import config_dir, ensure_dirs, programs_file
 from .programs import Program, Registry
 
@@ -705,6 +705,44 @@ def _offer_service_teardown() -> None:
         print("   left running — `harness down` stops everything.")
 
 
+def _cmd_auto(args: argparse.Namespace) -> None:
+    """Headless autonomous run: recon + scan for every program, fill the queue.
+
+    No TUI, no prompts, no upload — safe to run from cron or Hermes while you do
+    other things. Reviewing and submitting happen later in the TUI. Each program
+    runs with its own settings; a real program stays passive (GET/HEAD) unless it
+    was explicitly armed, so this never sends attack traffic or submits anything.
+    """
+    print("→ preparing cve-index services…")
+    try:
+        asyncio.run(_ensure_cve_index_running())
+        asyncio.run(_ensure_cve_corpus())
+    except Exception as exc:
+        print(f"❌ could not prepare cve-index: {exc}")
+        _teardown_services(stop_zap=False, only_if_owned=True)
+        return
+
+    try:
+        registry = Registry.load(programs_file())
+        names = registry.names()
+        if not names:
+            print("no programs defined — add one with `harness add-prog NAME SCOPE SEEDS`.")
+            return
+        asyncio.run(_run_pipeline(registry, names))
+
+        total = 0
+        for prog_name in names:
+            vulns = store.load_vulns(prog_name)
+            records = [findings_store.record_from_vuln(prog_name, v) for v in vulns]
+            written = findings_store.upsert_findings(prog_name, records)
+            total += written
+            print(f"  {prog_name}: {written} finding(s) in the review queue")
+        print(f"✅ {total} finding(s) ready — open `harness` and press f to review.")
+    finally:
+        # Stop only what this run started; never touch a stack you keep up yourself.
+        _teardown_services(stop_zap=False, only_if_owned=True)
+
+
 def _cmd_tui(args: argparse.Namespace) -> None:
     from .tui.app import HarnessApp
 
@@ -752,6 +790,14 @@ def main() -> None:
     # ── Global pipeline ───────────────────────────────────────────────────────
     p_global = sub.add_parser("global", help="run nightly pipeline for all programs, open Triage dashboard, generate reports, and optionally upload")
     p_global.set_defaults(func=_cmd_global)
+
+    # ── Headless autonomous run ───────────────────────────────────────────────
+    p_auto = sub.add_parser(
+        "auto",
+        help="headless run: recon + scan for all programs and fill the review "
+             "queue (no TUI, no prompts, no upload)",
+    )
+    p_auto.set_defaults(func=_cmd_auto)
 
     # ── HackerOne scope import ────────────────────────────────────────────────
     p_scope = sub.add_parser(

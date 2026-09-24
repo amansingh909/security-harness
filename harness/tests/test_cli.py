@@ -96,7 +96,7 @@ def test_every_subcommand_handler_exists():
     import time, but a renamed one only fails when that command is run."""
     for handler in ("_cmd_tui", "_cmd_list", "_cmd_add", "_cmd_add_prog",
                     "_cmd_hunt", "_cmd_scan", "_cmd_global", "_cmd_up",
-                    "_cmd_down"):
+                    "_cmd_down", "_cmd_auto"):
         assert callable(getattr(cli, handler, None)), f"{handler} missing"
 
 
@@ -336,3 +336,48 @@ def test_ensure_cve_corpus_ingests_full_when_empty(monkeypatch):
     assert captured["argv"][1:3] == ["-m", "cve_index"]
     assert "ingest" in captured["argv"]
     assert "--mode" in captured["argv"] and "full" in captured["argv"]
+
+
+# --- headless run: `harness auto` fills the review queue, no prompts ----------
+#
+# The autonomous entry point: recon + scan for every program, convert the scan
+# output into per-finding records for the TUI to review. It must be fully
+# non-interactive (cron/Hermes runs it) and must never upload.
+
+def test_cmd_auto_fills_review_queue_without_prompts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="acme", in_scope=["*.acme.com"], seeds=["www.acme.com"]))
+    reg.save(tmp_path / "programs.yaml")
+
+    async def _ok(*a, **k):
+        return None
+    monkeypatch.setattr(cli, "_ensure_cve_index_running", _ok)
+    monkeypatch.setattr(cli, "_ensure_cve_corpus", _ok)
+
+    async def fake_pipeline(registry, names):
+        for name in names:
+            cli.store.save_vulns(name, [{
+                "host": "dev.acme.com",
+                "service": {"host": "dev.acme.com", "port": 443},
+                "cves": [{"id": "CVE-2021-1", "product": "nginx",
+                          "version": "1.0", "source": "cve-index"}],
+                "priority_score": 10,
+            }])
+    monkeypatch.setattr(cli, "_run_pipeline", fake_pipeline)
+    monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
+
+    def no_input(*a, **k):
+        raise AssertionError("`harness auto` must never prompt")
+    monkeypatch.setattr("builtins.input", no_input)
+
+    cli._cmd_auto(argparse.Namespace())
+
+    from harness import findings_store as fs
+    recs = fs.load_findings("acme")
+    assert [r.host for r in recs] == ["dev.acme.com"]
+    assert recs[0].status == "needs_check"
+    assert recs[0].cves[0]["id"] == "CVE-2021-1"
