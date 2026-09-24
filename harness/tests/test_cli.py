@@ -96,7 +96,8 @@ def test_every_subcommand_handler_exists():
     import time, but a renamed one only fails when that command is run."""
     for handler in ("_cmd_tui", "_cmd_list", "_cmd_add", "_cmd_add_prog",
                     "_cmd_hunt", "_cmd_scan", "_cmd_global", "_cmd_up",
-                    "_cmd_down", "_cmd_auto", "_cmd_seed_practice"):
+                    "_cmd_down", "_cmd_auto", "_cmd_seed_practice",
+                    "_cmd_set_header", "_cmd_show_policy"):
         assert callable(getattr(cli, handler, None)), f"{handler} missing"
 
 
@@ -544,6 +545,39 @@ def test_auto_refreshes_h1_scope_before_the_pipeline(tmp_path, monkeypatch):
 
     cli._cmd_auto(argparse.Namespace())
     assert order == ["refresh", "pipeline"]  # scope refreshed BEFORE recon
+
+
+# --- per-program config an agent can set from a program's requirements --------
+
+def test_set_header_persists_a_program_header(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="clear", in_scope=["clearme.com"], seeds=["clearme.com"]))
+    reg.save(tmp_path / "programs.yaml")
+
+    cli._cmd_set_header(argparse.Namespace(
+        program="clear", name="X-Bug-Bounty", value="HackerOne-88yk"))
+
+    p = Registry.load(tmp_path / "programs.yaml").get("clear")
+    assert p.extra_headers == {"X-Bug-Bounty": "HackerOne-88yk"}
+
+
+def test_set_header_unknown_program_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    import pytest
+    with pytest.raises(SystemExit):
+        cli._cmd_set_header(argparse.Namespace(
+            program="nope", name="X", value="y"))
+
+
+def test_show_policy_prints_the_fetched_policy(monkeypatch, capsys):
+    monkeypatch.setenv("H1_IDENTIFIER", "id")
+    monkeypatch.setenv("H1_API_KEY", "key")
+    monkeypatch.setattr(cli, "_fetch_h1_policy",
+                        lambda handle, ident, tok: "POLICY-FOR-" + handle)
+    cli._cmd_show_policy(argparse.Namespace(handle="clear"))
+    assert "POLICY-FOR-clear" in capsys.readouterr().out
 
 
 # --- seed the practice targets ------------------------------------------------

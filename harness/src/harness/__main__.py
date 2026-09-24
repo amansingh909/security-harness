@@ -748,6 +748,50 @@ def _cmd_seed_practice(args: argparse.Namespace) -> None:
     print("Run `harness auto` to recon and actively test them.")
 
 
+def _cmd_set_header(args: argparse.Namespace) -> None:
+    """Set a per-program request header (persisted), e.g. a required testing header.
+
+    Used for programs like CLEAR that require `X-Bug-Bounty: HackerOne-<user>` on
+    every request. Once set, the header rides every request the harness makes to
+    that program's assets.
+    """
+    ensure_dirs()
+    registry = Registry.load(programs_file())
+    program = registry.get(args.program)
+    if program is None:
+        raise SystemExit(f"no program named {args.program!r} — import or add it first")
+    headers = dict(program.extra_headers or {})
+    headers[args.name] = args.value
+    registry.add(program.model_copy(update={"extra_headers": headers}))
+    registry.save(programs_file())
+    print(f"set header on {args.program!r}: {args.name}: {args.value}")
+
+
+def _fetch_h1_policy(handle: str, identifier: str, token: str) -> str:
+    """Fetch a HackerOne program's policy text via the API."""
+    import base64
+
+    import httpx
+
+    cred = base64.b64encode(f"{identifier}:{token}".encode()).decode()
+    resp = httpx.get(
+        f"https://api.hackerone.com/v1/hackers/programs/{handle}",
+        headers={"Authorization": f"Basic {cred}", "Accept": "application/json"},
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    return (resp.json().get("attributes") or {}).get("policy") or ""
+
+
+def _cmd_show_policy(args: argparse.Namespace) -> None:
+    """Print a HackerOne program's policy so its requirements can be read."""
+    identifier = os.getenv("H1_IDENTIFIER")
+    token = os.getenv("H1_API_KEY")
+    if not identifier or not token:
+        raise SystemExit("set H1_IDENTIFIER and H1_API_KEY in ~/.harness/.env")
+    print(_fetch_h1_policy(args.handle, identifier, token) or "(no policy returned)")
+
+
 async def _refresh_h1_scopes(registry: Registry, names: list[str]) -> None:
     """Re-pull each HackerOne-imported program's scope from the API before a run.
 
@@ -919,6 +963,23 @@ def main() -> None:
         help="add the default practice targets (intentionally-vulnerable test sites)",
     )
     p_seed.set_defaults(func=_cmd_seed_practice)
+
+    # ── Per-program config an agent sets from a program's requirements ────────
+    p_seth = sub.add_parser(
+        "set-header",
+        help="set a per-program request header (e.g. a required X-Bug-Bounty header)",
+    )
+    p_seth.add_argument("program")
+    p_seth.add_argument("name", help="header name, e.g. X-Bug-Bounty")
+    p_seth.add_argument("value", help="header value, e.g. HackerOne-<username>")
+    p_seth.set_defaults(func=_cmd_set_header)
+
+    p_pol = sub.add_parser(
+        "show-policy",
+        help="print a HackerOne program's policy so its requirements can be read",
+    )
+    p_pol.add_argument("handle", help="HackerOne program handle, e.g. clear")
+    p_pol.set_defaults(func=_cmd_show_policy)
 
     # ── HackerOne scope import ────────────────────────────────────────────────
     p_scope = sub.add_parser(
