@@ -32,7 +32,10 @@ class FindingRecord(BaseModel):
     id: str
     program: str
     host: str = ""
+    url: str = ""
     service: dict = Field(default_factory=dict)
+    signals: list[str] = Field(default_factory=list)      # what recon actually found
+    fingerprints: list[dict] = Field(default_factory=list)
     cves: list[dict] = Field(default_factory=list)
     priority_score: int = 0
     status: FindingStatus = "needs_check"
@@ -58,6 +61,30 @@ def record_from_vuln(program: str, vuln: dict) -> FindingRecord:
         service=service,
         cves=vuln.get("cves", []),
         priority_score=vuln.get("priority_score", 0),
+        status="needs_check",
+    )
+
+
+def record_from_lead(program: str, lead: dict) -> FindingRecord:
+    """Build a record from a recon lead — where the real findings (signals) live.
+
+    A lead carries the signals recon actually observed (reflected XSS, exposed
+    paths, version disclosure) plus fingerprints and any CVE candidates. This is
+    the review-queue source; the id is stable per host so a re-run updates in
+    place.
+    """
+    host = lead.get("host", "")
+    return FindingRecord(
+        id=finding_id(program, host, ""),
+        program=program,
+        host=host,
+        url=lead.get("url", ""),
+        service={"host": host, "url": lead.get("url", ""),
+                 "status_code": lead.get("status")},
+        signals=lead.get("signals", []),
+        fingerprints=lead.get("fingerprints", []),
+        cves=lead.get("cve_candidates", []),
+        priority_score=lead.get("priority_score", 0),
         status="needs_check",
     )
 

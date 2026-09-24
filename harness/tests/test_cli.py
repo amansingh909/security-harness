@@ -360,12 +360,14 @@ def test_cmd_auto_fills_review_queue_without_prompts(tmp_path, monkeypatch):
 
     async def fake_pipeline(registry, names):
         for name in names:
-            cli.store.save_vulns(name, [{
+            cli.store.save_leads(name, [{
                 "host": "dev.acme.com",
-                "service": {"host": "dev.acme.com", "port": 443},
-                "cves": [{"id": "CVE-2021-1", "product": "nginx",
-                          "version": "1.0", "source": "cve-index"}],
+                "url": "http://dev.acme.com",
+                "signals": ["sensitive path exposed (/info.php) — information disclosure"],
+                "fingerprints": [{"product": "nginx", "version": "1.0"}],
+                "cve_candidates": [],
                 "priority_score": 10,
+                "status": 200,
             }])
     monkeypatch.setattr(cli, "_run_pipeline", fake_pipeline)
     monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
@@ -380,7 +382,7 @@ def test_cmd_auto_fills_review_queue_without_prompts(tmp_path, monkeypatch):
     recs = fs.load_findings("acme")
     assert [r.host for r in recs] == ["dev.acme.com"]
     assert recs[0].status == "needs_check"
-    assert recs[0].cves[0]["id"] == "CVE-2021-1"
+    assert any("/info.php" in s for s in recs[0].signals)
 
 
 # --- practice vs real: the bright line, enforced ------------------------------

@@ -81,3 +81,39 @@ def test_upsert_new_finding_is_needs_check(tmp_path, monkeypatch):
     n = fs.upsert_findings("acme", [fresh])
     assert n == 1
     assert fs.get_finding("acme", fresh.id).status == "needs_check"
+
+
+# A recon lead: this is where the real findings live (signals like XSS,
+# exposed paths, version disclosure), not in the CVE-correlation pass.
+LEAD = {
+    "host": "testasp.vulnweb.com",
+    "url": "http://testasp.vulnweb.com",
+    "priority_score": 7,
+    "signals": [
+        "version disclosed (microsoft-iis 8.5) — CVE surface",
+        "reflected input (unencoded) — possible XSS at /Search.asp via 'tfSearch'",
+    ],
+    "fingerprints": [
+        {"product": "microsoft-iis", "version": "8.5",
+         "evidence": "server: Microsoft-IIS/8.5"},
+    ],
+    "cve_candidates": [],
+    "status": 200,
+}
+
+
+def test_record_from_lead_carries_signals_and_fingerprints():
+    rec = fs.record_from_lead("acme", LEAD)
+    assert rec.host == "testasp.vulnweb.com"
+    assert rec.url == "http://testasp.vulnweb.com"
+    assert any("XSS" in s for s in rec.signals)
+    assert rec.fingerprints[0]["product"] == "microsoft-iis"
+    assert rec.priority_score == 7
+    assert rec.status == "needs_check"
+
+
+def test_record_from_lead_id_is_stable_per_host(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    a = fs.record_from_lead("acme", LEAD)
+    b = fs.record_from_lead("acme", LEAD)
+    assert a.id == b.id  # a re-run updates the same host in place

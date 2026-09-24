@@ -794,8 +794,11 @@ def _cmd_auto(args: argparse.Namespace) -> None:
 
         total = 0
         for prog_name in names:
-            vulns = store.load_vulns(prog_name)
-            records = [findings_store.record_from_vuln(prog_name, v) for v in vulns]
+            # The recon leads carry the real findings (signals: reflected XSS,
+            # exposed paths, version disclosure); the CVE-correlation pass only
+            # enriches them, so the review queue is built from the leads.
+            leads = store.load_leads(prog_name)
+            records = [findings_store.record_from_lead(prog_name, lead) for lead in leads]
             written = findings_store.upsert_findings(prog_name, records)
             total += written
             print(f"  {prog_name}: {written} finding(s) in the review queue")

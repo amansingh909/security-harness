@@ -354,7 +354,7 @@ class FindingsScreen(ModalScreen[None]):
 
     def on_mount(self) -> None:
         table = self.query_one("#findings-table", DataTable)
-        table.add_columns("Program", "Status", "Score", "Host:Port", "Service", "CVEs")
+        table.add_columns("Program", "Status", "Score", "Host", "Findings", "Top signal")
         self._populate_table()
 
     def _populate_table(self) -> None:
@@ -362,23 +362,19 @@ class FindingsScreen(ModalScreen[None]):
         table.clear()
         self._ordered = []
         for record in collect_findings(self.registry):
-            service = record.service or {}
-            host = record.host or service.get("host", "")
-            port = service.get("port", "")
-            hostport = f"{host}:{port}" if port else host
-            scheme = service.get("scheme", "")
-            service_desc = (
-                f"{scheme.upper()} {service.get('server', '')} "
-                f"{service.get('powered_by', '')}"
-            ).strip()
+            host = record.host or (record.service or {}).get("host", "")
+            signals = record.signals or []
+            top = signals[0] if signals else "—"
+            if len(top) > 61:
+                top = top[:60] + "…"
             self._ordered.append((record.program, record.id))
             table.add_row(
                 record.program,
                 _status_cell(record.status),
                 _score_cell(record.priority_score),
-                hostport,
-                service_desc,
-                str(len(record.cves)),
+                host,
+                str(len(signals)),
+                top,
                 key=record.id,
             )
 
