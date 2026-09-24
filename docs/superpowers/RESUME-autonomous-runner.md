@@ -1,10 +1,19 @@
 # Resume here — Autonomous Bounty Runner (state @ 2026-09-23)
 
-**Status:** **Milestone 1 BUILT** — 6 tasks, all committed on branch
-`active-test-extension`, every suite green (harness 67, bounty-reporter 36,
-recon-orchestrator 121). The harness now runs headless and findings are
-reviewable/markable in the TUI. Next: practice-site exploit mode, report
-drafting + humanizer, in-TUI submit.
+**Status:** **Milestones 1-2 built and LIVE-VERIFIED against vulnweb** (2026-09-23).
+All committed on branch `active-test-extension`, suites green (harness 83,
+bounty-reporter 36, recon-orchestrator 121). Next: in-TUI submit flow.
+
+### Live verification (2026-09-23)
+`harness auto --programs vulnweb` ran the whole pipeline end to end: started
+services, ingested the CVE corpus (5,697 vectors, semantic search live), ran
+active recon against the vulnweb family, filed findings, and tore services down.
+The active engine found real bugs — **reflected XSS** on testasp.vulnweb.com
+(`/Search.asp` via `tfSearch`), **exposed `/info.php`** on rest.vulnweb.com, and
+version disclosures — all `needs_check` in the review queue. **Bug found and
+fixed during the run:** the queue was built from the (empty) CVE-correlation
+pass; it now builds from the recon leads, where the signals actually live
+(`record_from_lead` + `url`/`signals`/`fingerprints` on `FindingRecord`).
 
 ### Milestone 1 — DONE (each its own commit, authored solely by the user)
 1. `fix: launch cve-index with the venv interpreter, not poetry run` — startup crash.
