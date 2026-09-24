@@ -77,38 +77,78 @@ def test_upload_rejects_a_missing_report(tmp_path):
 
 # --- Finding construction ----------------------------------------------------
 
-def test_build_finding_supplies_required_fields():
-    """Finding.vuln_type is required and steps_to_reproduce is a list[str];
-    passing neither raised ValidationError for every real vulnerability."""
-    finding = _build_finding("prog", VULN)
-
-    assert finding.vuln_type
-    assert isinstance(finding.steps_to_reproduce, list)
-    assert len(finding.steps_to_reproduce) >= 1
-    assert all(isinstance(s, str) for s in finding.steps_to_reproduce)
-
-
-def test_build_finding_names_the_cve_when_present():
-    finding = _build_finding("prog", VULN)
-    assert "CVE-2024-1234" in finding.vuln_type
-    assert finding.asset == "www.example.com:443"
-
-
-def test_build_finding_without_cves():
-    """A finding with no CVE still has to produce a valid submission."""
-    vuln = {**VULN, "cves": []}
-    finding = _build_finding("prog", vuln)
-
-    assert finding.vuln_type
-    assert finding.cvss_vector is None
-    assert len(finding.steps_to_reproduce) >= 1
+# A finding the operator has verified: it carries real evidence the scanner
+# could never produce on its own.
+VERIFIED = {
+    "vuln_type": "IDOR",
+    "asset": "https://app.example.com/api/invoices/{id}",
+    "steps_to_reproduce": [
+        "Log in as User A and note User B's invoice id 4021.",
+        "As User A, GET /api/invoices/4021.",
+        "Observe User B's invoice returned in full.",
+    ],
+    "observed_result": "User B's invoice was returned under User A's session.",
+    "impact": "Any authenticated user can read any other user's invoices by id.",
+    "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+    "cwe": "CWE-639",
+}
 
 
-def test_build_finding_carries_the_observed_banner():
-    """server/powered_by were computed and thrown away, leaving the report a
-    bare placeholder with nothing reproducible in it."""
-    finding = _build_finding("prog", VULN)
-    assert "nginx/1.24.0" in finding.observed_result
+def test_build_finding_refuses_an_unverified_scan_lead():
+    """The scanner never observes impact, reproduces anything, or confirms a
+    bug — inventing those fields manufactures evidence that gets an account
+    banned once submitted. A raw scan lead must be refused, not fabricated."""
+    with pytest.raises(ValueError, match="unverified"):
+        _build_finding("prog", VULN)
+
+
+def test_build_finding_builds_from_verified_evidence():
+    """Given a finding the operator has completed with real evidence, build it."""
+    finding = _build_finding("prog", VERIFIED)
+    assert finding.vuln_type == "IDOR"
+    assert finding.observed_result.startswith("User B")
+    assert finding.impact
+    assert len(finding.steps_to_reproduce) == 3
+    assert finding.cwe == "CWE-639"
+
+
+def test_upload_does_not_post_an_unverified_scan_lead(tmp_path, monkeypatch):
+    """The batch report is raw scan output; upload must refuse every finding and
+    never send a single fabricated submission to a real program."""
+    report = tmp_path / "r.json"
+    report.write_text(json.dumps({"vulnerabilities": [VULN]}))
+
+    posted = {"count": 0}
+
+    class CountingClient:
+        def __init__(self, *a, **k):
+            ...
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            posted["count"] += 1
+
+            class _Resp:
+                status_code = 201
+                text = "ok"
+
+            return _Resp()
+
+    monkeypatch.setattr("bounty_reporter.uploader.httpx.AsyncClient", CountingClient)
+
+    result = upload_report(report, "prog", "a-token", "bc-token", h1_identifier="id")
+
+    assert posted["count"] == 0, "upload attempted a POST for an unverified scan lead"
+    assert result["hackerone"]["sent"] == 0
+    assert result["bugcrowd"]["sent"] == 0
+    assert result["hackerone"]["failed"] == 1
+    assert result["bugcrowd"]["failed"] == 1
+    assert any("unverified" in e.lower() for e in result["hackerone"]["errors"])
 
 
 def test_cvss_score_comes_from_the_scan_not_the_vector():
