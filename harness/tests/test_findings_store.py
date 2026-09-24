@@ -117,3 +117,16 @@ def test_record_from_lead_id_is_stable_per_host(tmp_path, monkeypatch):
     a = fs.record_from_lead("acme", LEAD)
     b = fs.record_from_lead("acme", LEAD)
     assert a.id == b.id  # a re-run updates the same host in place
+
+
+def test_set_evidence_persists_and_survives_a_rescan(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    rec = fs.record_from_lead("acme", LEAD)
+    fs.save_finding(rec)
+    fs.set_evidence("acme", rec.id, {"vuln_type": "XSS", "impact": "session theft"})
+    assert fs.get_finding("acme", rec.id).evidence["vuln_type"] == "XSS"
+
+    # a later scan re-files the same host; the operator's evidence is kept
+    fs.upsert_findings("acme", [fs.record_from_lead("acme", LEAD)])
+    got = fs.get_finding("acme", rec.id)
+    assert got.evidence.get("vuln_type") == "XSS"

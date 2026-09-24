@@ -7,7 +7,7 @@ from pathlib import Path
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -18,6 +18,7 @@ from textual.widgets import (
     Input,
     Label,
     Static,
+    TextArea,
 )
 import os
 
@@ -326,6 +327,120 @@ def collect_findings(registry: Registry) -> list[FindingRecord]:
     return out
 
 
+class FindingDetailScreen(ModalScreen[None]):
+    """Verify a finding, draft its humanized report, and submit it.
+
+    Fill in the evidence a passive scan can't know — what you confirmed by hand —
+    then Ctrl+D to preview the humanized report, Ctrl+S to submit (twice, to
+    confirm). Nothing is submitted without your keypress, and the uploader
+    refuses anything missing real evidence.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Back"),
+        Binding("ctrl+d", "draft", "Draft report"),
+        Binding("ctrl+s", "submit", "Submit"),
+    ]
+
+    def __init__(self, record: FindingRecord) -> None:
+        super().__init__()
+        self.record = record
+        self._confirm = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        ev = self.record.evidence or {}
+        with VerticalScroll():
+            signals = "\n".join(f"• {s}" for s in (self.record.signals or [])) or "—"
+            yield Static(
+                f"[b]{self.record.host}[/b]  {self.record.url}\n"
+                f"[dim]what recon saw:[/dim]\n{signals}",
+                id="context",
+            )
+            yield Label("Vulnerability type")
+            yield Input(value=ev.get("vuln_type", ""), id="vuln_type",
+                        placeholder="e.g. Reflected XSS")
+            yield Label("Asset (URL / endpoint / parameter)")
+            yield Input(value=ev.get("asset", self.record.url or self.record.host),
+                        id="asset")
+            yield Label("Steps to reproduce (one per line)")
+            yield TextArea("\n".join(ev.get("steps_to_reproduce", [])), id="steps")
+            yield Label("Observed result (what you actually saw)")
+            yield Input(value=ev.get("observed_result", ""), id="observed")
+            yield Label("Impact")
+            yield Input(value=ev.get("impact", ""), id="impact")
+            yield Static("", id="preview")
+        yield Footer()
+
+    def _evidence(self) -> dict:
+        steps = [line for line in self.query_one("#steps", TextArea).text.splitlines()
+                 if line.strip()]
+        return {
+            "program": self.record.program,
+            "vuln_type": self.query_one("#vuln_type", Input).value.strip(),
+            "asset": (self.query_one("#asset", Input).value.strip()
+                      or self.record.url or self.record.host),
+            "steps_to_reproduce": steps,
+            "observed_result": self.query_one("#observed", Input).value.strip(),
+            "impact": self.query_one("#impact", Input).value.strip(),
+        }
+
+    def _persist(self, evidence: dict) -> None:
+        findings_store.set_evidence(self.record.program, self.record.id, evidence)
+
+    def _show(self, text: str) -> None:
+        self.query_one("#preview", Static).update(text)
+
+    def action_draft(self) -> None:
+        self._confirm = False
+        evidence = self._evidence()
+        self._persist(evidence)
+        try:
+            markdown = engine.draft_report(evidence)
+        except ValueError as exc:
+            self._show(f"Can't draft yet — {exc}")
+            return
+        self._show(markdown)
+
+    def action_submit(self) -> None:
+        evidence = self._evidence()
+        self._persist(evidence)
+        required = ("vuln_type", "steps_to_reproduce", "observed_result", "impact")
+        missing = [f for f in required if not evidence.get(f)]
+        if missing:
+            self._confirm = False
+            self._show("Fill in before submitting: " + ", ".join(missing))
+            return
+        if not self._confirm:
+            self._confirm = True
+            self._show(f"⚠️  Submit to program '{self.record.program}'? "
+                       "Press Ctrl+S again to confirm.")
+            return
+        self._confirm = False
+        h1_key = os.getenv("H1_API_KEY")
+        bc_key = os.getenv("BC_API_KEY")
+        if not (h1_key or bc_key):
+            self._show("No API keys set — add H1_IDENTIFIER + H1_API_KEY (or "
+                       "BC_API_KEY) to ~/.harness/.env, then submit again.")
+            return
+        try:
+            result = engine.submit_finding(
+                evidence, self.record.program,
+                h1_key=h1_key, bc_key=bc_key,
+                h1_identifier=os.getenv("H1_IDENTIFIER"),
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any submit error to the operator
+            self._show(f"Submit failed: {exc}")
+            return
+        findings_store.update_status(self.record.program, self.record.id,
+                                     "real", note="submitted")
+        self._show(f"✅ submitted. {result}")
+
+    def action_close(self) -> None:
+        self._persist(self._evidence())
+        self.dismiss(None)
+
+
 class FindingsScreen(ModalScreen[None]):
     """The review queue: every finding across all programs, marked in place.
 
@@ -386,6 +501,16 @@ class FindingsScreen(ModalScreen[None]):
         program, fid = self._ordered[idx]
         findings_store.update_status(program, fid, status)
         self._populate_table()
+
+    def on_data_table_row_selected(self, event) -> None:
+        """Enter on a row opens that finding to verify, draft, and submit."""
+        row_key = event.row_key.value if event.row_key is not None else None
+        for program, fid in self._ordered:
+            if fid == row_key:
+                record = findings_store.get_finding(program, fid)
+                if record is not None:
+                    self.app.push_screen(FindingDetailScreen(record))
+                return
 
     def action_mark_real(self) -> None:
         self._mark("real")

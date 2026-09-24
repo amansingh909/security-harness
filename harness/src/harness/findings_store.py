@@ -39,6 +39,7 @@ class FindingRecord(BaseModel):
     cves: list[dict] = Field(default_factory=list)
     priority_score: int = 0
     status: FindingStatus = "needs_check"
+    evidence: dict = Field(default_factory=dict)   # operator-verified: vuln_type/steps/…
     note: str = ""
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
@@ -142,6 +143,17 @@ def update_status(
     return record
 
 
+def set_evidence(program: str, fid: str, evidence: dict) -> FindingRecord | None:
+    """Attach operator-verified evidence to a finding; returns the saved record."""
+    record = get_finding(program, fid)
+    if record is None:
+        return None
+    record.evidence = evidence
+    record.updated_at = _now()
+    save_finding(record)
+    return record
+
+
 def upsert_findings(program: str, records: list[FindingRecord]) -> int:
     """Persist scan records, preserving any operator verdict already on file.
 
@@ -154,6 +166,8 @@ def upsert_findings(program: str, records: list[FindingRecord]) -> int:
         existing = get_finding(program, record.id)
         if existing is not None:
             record.created_at = existing.created_at
+            if existing.evidence:
+                record.evidence = existing.evidence
             if existing.status in _OPERATOR_STATUSES:
                 record.status = existing.status
                 record.note = existing.note
