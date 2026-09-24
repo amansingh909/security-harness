@@ -122,6 +122,33 @@ def render_report(finding_path: str) -> dict:
     }
 
 
+def draft_report(finding: dict) -> str:
+    """Render a submittable Markdown report from a VERIFIED finding, prose humanized.
+
+    Builds a bounty_reporter Finding (which refuses missing or blank evidence),
+    humanizes only the narrative fields — summary / impact / remediation — and
+    never the reproduction steps, request/response, or CVSS, then renders
+    Markdown. Raises ValueError if the finding lacks real evidence.
+    """
+    try:
+        from bounty_reporter.generator import generate
+        from bounty_reporter.models import Finding
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise ComponentMissing(
+            "bounty-reporter not installed. Run: pip install -e ../bounty-reporter"
+        ) from exc
+
+    from .humanizer import humanize
+
+    model = Finding.from_dict(finding)  # raises if evidence is missing/blank
+    if model.summary:
+        model.summary = humanize(model.summary)
+    model.impact = humanize(model.impact)
+    if model.remediation:
+        model.remediation = humanize(model.remediation)
+    return generate(model).markdown
+
+
 def available() -> dict[str, bool]:
     """Which sibling components are importable in this environment."""
     import importlib.util
