@@ -248,3 +248,44 @@ def test_zap_daemon_script_supports_stop_and_status():
         text = fh.read()
     assert "stop)" in text and "status)" in text
     assert "core/action/shutdown" in text
+
+
+# --- startup: launch cve-index without poetry ---------------------------------
+#
+# The crash this pins: `_ensure_cve_index_running` started the server with
+# `poetry run cve-index serve`, but there is no poetry env — poetry then spins
+# up an empty virtualenv missing every cve-index dependency, the server exits
+# instantly, and the whole `global`/`auto` run aborts at step 0. Start it with
+# the interpreter already running the harness, as `python -m cve_index serve`.
+
+def test_ensure_cve_index_starts_server_without_poetry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))  # keep the pid file out of real $HOME
+    monkeypatch.setattr(cli, "_we_started_cve_stack", False)
+
+    state = {"n": 0}
+
+    async def health(url="http://localhost:8080"):
+        state["n"] += 1
+        return state["n"] > 1  # unhealthy at entry, healthy once "started"
+    monkeypatch.setattr(cli, "_cve_index_healthy", health)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: None)
+
+    captured: dict = {}
+
+    class FakeProc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, *a, **k):
+        captured["argv"] = list(argv)
+        return FakeProc()
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    asyncio.run(cli._ensure_cve_index_running())
+
+    assert "poetry" not in captured["argv"], "must not shell out to poetry"
+    assert captured["argv"][0] == sys.executable
+    assert captured["argv"][1:3] == ["-m", "cve_index"]
+    assert "serve" in captured["argv"]

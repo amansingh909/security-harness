@@ -16,6 +16,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from getpass import getpass
 from pathlib import Path
@@ -476,10 +477,15 @@ async def _ensure_cve_index_running() -> None:
     except OSError as exc:
         print(f"⚠️  Could not run docker compose: {exc}")
 
-    # Start the FastAPI server in the background.
+    # Start the FastAPI server in the background, using the interpreter already
+    # running the harness (`python -m cve_index serve`). `poetry run` used to be
+    # here, but there is no poetry env — poetry then built a fresh empty
+    # virtualenv with none of cve-index's dependencies, so the server exited
+    # instantly and aborted the whole run at step 0. This venv already has the
+    # cve_index package installed, so `-m` finds it.
     try:
         _cve_index_server_proc = subprocess.Popen(
-            ["poetry", "run", "cve-index", "serve"],
+            [sys.executable, "-m", "cve_index", "serve"],
             cwd=_cve_index_dir(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -489,8 +495,8 @@ async def _ensure_cve_index_running() -> None:
             f.write(str(_cve_index_server_proc.pid))
     except FileNotFoundError:
         raise RuntimeError(
-            "`poetry` not found — cannot start cve-index. Install poetry or start "
-            "the service manually."
+            f"could not launch cve-index with {sys.executable!r} — is the "
+            "cve_index package installed in this environment?"
         ) from None
     except OSError as exc:
         raise RuntimeError(f"Could not launch cve-index serve: {exc}") from exc
