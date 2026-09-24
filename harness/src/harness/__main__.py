@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -222,17 +223,62 @@ def _cmd_preview(args: argparse.Namespace) -> None:
           "disabled (or a bypass) for the scan to reach them.")
 
 
-def _cmd_up(args: argparse.Namespace) -> None:
-    """Start Elasticsearch and cve‑index services and verify health."""
-    # Run the async helper that starts services and waits for health
-    try:
-        asyncio.run(_ensure_cve_index_running())
-        print("✅ Services are up and healthy.")
-    except Exception as exc:
-        print(f"❌ Failed to start services: {exc}")
+# ── Service lifecycle: own what you start, stop it when you're done ──────────
+# These back the auto-teardown so ZAP and the CVE stack no longer outlive the
+# run that spawned them. Everything here is best-effort and idempotent: a
+# teardown must never crash the command that called it.
+_cve_index_server_proc = None      # Popen for `cve-index serve`, if we started it
+_we_started_cve_stack = False      # True only if THIS process brought the stack up
 
-def _cmd_down(args: argparse.Namespace) -> None:
-    """Stop cve‑index server and bring down Elasticsearch."""
+
+def _zap_endpoint() -> tuple[str, str | None]:
+    """ZAP API base URL and key from the environment (~/.harness/.env)."""
+    url = (os.getenv("ZAP_API_URL") or "http://127.0.0.1:8081").rstrip("/")
+    return url, os.getenv("ZAP_API_KEY")
+
+
+def _zap_is_up() -> bool:
+    """True if the local ZAP daemon answers its API. Never raises."""
+    url, key = _zap_endpoint()
+    if not key:
+        return False
+    try:
+        import httpx
+
+        resp = httpx.get(f"{url}/JSON/core/view/version/",
+                         params={"apikey": key}, timeout=3.0)
+        return resp.status_code == 200 and "version" in resp.text
+    except Exception:  # noqa: BLE001 - a health probe must never raise
+        return False
+
+
+def _stop_zap() -> None:
+    """Shut the local ZAP daemon down cleanly; no-op if it isn't running.
+
+    Prefers ZAP's own shutdown API (graceful); if that fails, falls back to the
+    `zap-daemon stop` helper, which hard-kills the jar.
+    """
+    if not _zap_is_up():
+        return
+    url, key = _zap_endpoint()
+    try:
+        import httpx
+
+        httpx.get(f"{url}/JSON/core/action/shutdown/",
+                  params={"apikey": key}, timeout=5.0)
+        print("🛑 ZAP shut down.")
+        return
+    except Exception:  # noqa: BLE001 - fall through to the hard stop
+        pass
+    daemon = shutil.which("zap-daemon")
+    if daemon:
+        subprocess.run([daemon, "stop"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("🛑 ZAP stopped (via zap-daemon).")
+
+
+def _stop_cve_index() -> None:
+    """Stop the `cve-index serve` process (PID file first, pattern kill fallback)."""
     pid_path = Path(os.path.expanduser("~/.cve_index_pid"))
     stopped = False
     if pid_path.exists():
@@ -263,19 +309,53 @@ def _cmd_down(args: argparse.Namespace) -> None:
         )
         if killed.returncode == 0:
             print("🛑 Stopped cve-index via pattern match.")
-        else:
-            print("ℹ️  No running cve-index process found.")
 
-    # Bring down Elasticsearch
+
+def _compose_down() -> None:
+    """Bring the Elasticsearch docker-compose stack down."""
     compose = subprocess.run(
         ["docker", "compose", "down"], cwd=_cve_index_dir(),
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     if compose.returncode == 0:
-        print("🧹 Docker compose stack brought down.")
+        print("🧹 Elasticsearch stack brought down.")
     else:
         err = compose.stderr.decode(errors="replace").strip().splitlines()
         print(f"⚠️  docker compose down failed: {err[-1] if err else 'unknown error'}")
+
+
+def _teardown_services(*, stop_zap: bool = True, only_if_owned: bool = False) -> None:
+    """Stop harness-managed background services. Idempotent, best-effort.
+
+    only_if_owned=True  — auto-cleanup path: touch the CVE stack only if THIS
+                          process started it, so a stack you brought up yourself
+                          with `harness up` (or one already running for another
+                          reason) is left alone.
+    stop_zap            — also shut the local ZAP daemon down.
+    """
+    if not only_if_owned or _we_started_cve_stack:
+        _stop_cve_index()
+        _compose_down()
+    if stop_zap:
+        _stop_zap()
+
+
+def _cmd_up(args: argparse.Namespace) -> None:
+    """Start Elasticsearch and cve‑index services and verify health."""
+    # Run the async helper that starts services and waits for health
+    try:
+        asyncio.run(_ensure_cve_index_running())
+        print("✅ Services are up and healthy.")
+    except Exception as exc:
+        print(f"❌ Failed to start services: {exc}")
+
+def _cmd_down(args: argparse.Namespace) -> None:
+    """Stop everything the harness manages: cve‑index, Elasticsearch, and ZAP.
+
+    This is the "I'm done" button — a hard stop of every background service,
+    whether or not this process is the one that started them.
+    """
+    _teardown_services(stop_zap=True, only_if_owned=False)
 
 
 def _cmd_hunt(args: argparse.Namespace) -> None:
@@ -366,14 +446,21 @@ async def _ensure_cve_index_running() -> None:
     Starts them if needed (docker compose up -d elasticsearch, then cve-index serve).
     Waits until the health endpoint returns success.
     """
-    global _cve_index_server_proc
+    global _cve_index_server_proc, _we_started_cve_stack
 
     # If something is already serving, adopt it. Checking a module-level variable
     # is useless across processes — it is always unset in a fresh `harness` run,
     # so `harness up` followed by `harness global` used to spawn a second server
     # and overwrite the PID file, orphaning the first one.
+    #
+    # We adopt without claiming ownership: auto-teardown then leaves this stack
+    # alone, because we didn't start it.
     if await _cve_index_healthy():
         return
+
+    # From here on this process is the one bringing the stack up, so it is the
+    # one responsible for tearing it back down.
+    _we_started_cve_stack = True
 
     # Start ES via compose (idempotent)
     try:
@@ -473,72 +560,115 @@ def _cmd_global(args: argparse.Namespace) -> None:
     except Exception as exc:
         print(f"❌ Failed to start cve-index services: {exc}")
         print("    You may need to start Docker and/or install the cve-index CLI.")
+        # A start can fail half-way (ES up, server down); clean the partial start.
+        _teardown_services(stop_zap=False, only_if_owned=True)
         return
 
-    # 1️⃣ Run nightly recon & vuln scan for all programs, in one event loop.
-    registry = Registry.load(programs_file())
-    names = registry.names()
-    if not names:
-        print("no programs defined — add one with `harness add-prog NAME SCOPE SEEDS`.")
-        return
-    asyncio.run(_run_pipeline(registry, names))
+    # From here the CVE stack may be up because of THIS run; the finally makes
+    # sure it comes back down when we're done — on success, an error, or Ctrl-C —
+    # so a batch run never leaves Elasticsearch idling for hours afterwards.
+    try:
+        # 1️⃣ Run nightly recon & vuln scan for all programs, in one event loop.
+        registry = Registry.load(programs_file())
+        names = registry.names()
+        if not names:
+            print("no programs defined — add one with `harness add-prog NAME SCOPE SEEDS`.")
+            return
+        asyncio.run(_run_pipeline(registry, names))
 
-    # 2️⃣ Open triage UI (same as pressing `t` in the interactive TUI)
-    os.environ["HARNESS_AUTO_OPEN_TRIAGE"] = "1"
-    from .tui.app import HarnessApp
-    HarnessApp().run()
+        # 2️⃣ Open triage UI (same as pressing `t` in the interactive TUI)
+        os.environ["HARNESS_AUTO_OPEN_TRIAGE"] = "1"
+        from .tui.app import HarnessApp
+        HarnessApp().run()
 
-    # 3️⃣ After the UI exits, generate batch reports for each program.
-    from .paths import hunts_dir
+        # 3️⃣ After the UI exits, generate batch reports for each program.
+        from .paths import hunts_dir
 
-    # Keys come from ~/.harness/.env or the environment; getpass so a typed
-    # token is not echoed to the terminal or left sitting in scrollback.
-    h1_key = os.getenv("H1_API_KEY") or getpass("HackerOne API key (leave blank to skip): ").strip()
-    bc_key = os.getenv("BC_API_KEY") or getpass("Bugcrowd API key (leave blank to skip): ").strip()
+        # Keys come from ~/.harness/.env or the environment; getpass so a typed
+        # token is not echoed to the terminal or left sitting in scrollback.
+        h1_key = os.getenv("H1_API_KEY") or getpass("HackerOne API key (leave blank to skip): ").strip()
+        bc_key = os.getenv("BC_API_KEY") or getpass("Bugcrowd API key (leave blank to skip): ").strip()
 
-    for prog_name in registry.names():
-        vulns = store.load_vulns(prog_name)
-        if not vulns:
-            print(f"⚠️ No vulns for program {prog_name!r} – skipping report.")
-            continue
-        out_dir = hunts_dir() / prog_name
-        try:
-            md_path = engine.render_batch_report(prog_name, vulns, out_dir)
-            print(f"📄 Report for {prog_name!r} written to: {md_path}")
-        except Exception as exc:  # pragma: no cover
-            print(f"❌ Failed to render report for {prog_name!r}: {exc}")
-            continue
-
-        # 4️⃣ Upload if keys are supplied
-        if h1_key or bc_key:
-            # This submits real reports to a real program under the user's own
-            # account and cannot be undone, so confirm per program first.
-            targets = ", ".join(
-                n for n, k in (("HackerOne", h1_key), ("Bugcrowd", bc_key)) if k
-            )
-            answer = input(
-                f"Submit {len(vulns)} finding(s) for {prog_name!r} to {targets}? [y/N] "
-            ).strip().lower()
-            if answer not in ("y", "yes"):
-                print(f"   skipped upload for {prog_name!r}.")
+        for prog_name in registry.names():
+            vulns = store.load_vulns(prog_name)
+            if not vulns:
+                print(f"⚠️ No vulns for program {prog_name!r} – skipping report.")
                 continue
+            out_dir = hunts_dir() / prog_name
             try:
-                # bounty_reporter is a sibling top-level package, not a submodule
-                # of harness — a relative import escapes the package and fails.
-                from bounty_reporter.uploader import upload_report
-                # render_batch_report returns the Markdown path, but upload_report
-                # parses JSON. Both are written side by side in out_dir.
-                json_path = md_path.with_suffix(".json")
-                res = upload_report(json_path, prog_name, h1_key or None, bc_key or None)
-                print(f"📤 Upload result for {prog_name!r}: {res}")
+                md_path = engine.render_batch_report(prog_name, vulns, out_dir)
+                print(f"📄 Report for {prog_name!r} written to: {md_path}")
             except Exception as exc:  # pragma: no cover
-                print(f"❌ Upload failed for {prog_name!r}: {exc}")
+                print(f"❌ Failed to render report for {prog_name!r}: {exc}")
+                continue
+
+            # 4️⃣ Upload if keys are supplied
+            if h1_key or bc_key:
+                # This submits real reports to a real program under the user's own
+                # account and cannot be undone, so confirm per program first.
+                targets = ", ".join(
+                    n for n, k in (("HackerOne", h1_key), ("Bugcrowd", bc_key)) if k
+                )
+                answer = input(
+                    f"Submit {len(vulns)} finding(s) for {prog_name!r} to {targets}? [y/N] "
+                ).strip().lower()
+                if answer not in ("y", "yes"):
+                    print(f"   skipped upload for {prog_name!r}.")
+                    continue
+                try:
+                    # bounty_reporter is a sibling top-level package, not a submodule
+                    # of harness — a relative import escapes the package and fails.
+                    from bounty_reporter.uploader import upload_report
+                    # render_batch_report returns the Markdown path, but upload_report
+                    # parses JSON. Both are written side by side in out_dir.
+                    json_path = md_path.with_suffix(".json")
+                    res = upload_report(json_path, prog_name, h1_key or None, bc_key or None)
+                    print(f"📤 Upload result for {prog_name!r}: {res}")
+                except Exception as exc:  # pragma: no cover
+                    print(f"❌ Upload failed for {prog_name!r}: {exc}")
+    finally:
+        # Stop only what this run started; a stack you keep up yourself with
+        # `harness up` is left running. ZAP is user-managed, so it's untouched.
+        if _we_started_cve_stack:
+            print("🧽 cleaning up the services this run started…")
+        _teardown_services(stop_zap=False, only_if_owned=True)
+
+
+def _offer_service_teardown() -> None:
+    """After leaving the TUI, offer to stop background services still using RAM.
+
+    The TUI doesn't start these itself, so it can't silently own them — but
+    "I've left the harness" almost always means "I'm done", so we ask (default
+    yes) rather than let ZAP and Elasticsearch idle for hours.
+    """
+    running: list[str] = []
+    if _zap_is_up():
+        running.append("ZAP (~1GB)")
+    try:
+        if asyncio.run(_cve_index_healthy()):
+            running.append("cve-index + Elasticsearch (~0.6GB)")
+    except Exception:  # noqa: BLE001 - a status probe must never raise
+        pass
+    if not running:
+        return
+
+    print(f"\n⚙️  Still running in the background: {', '.join(running)}.")
+    try:
+        answer = input("Stop them now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("   left running — `harness down` stops everything.")
+        return
+    if answer in ("", "y", "yes"):
+        _teardown_services(stop_zap=True, only_if_owned=False)
+    else:
+        print("   left running — `harness down` stops everything.")
 
 
 def _cmd_tui(args: argparse.Namespace) -> None:
     from .tui.app import HarnessApp
 
     HarnessApp().run()
+    _offer_service_teardown()
 
 
 def main() -> None:
