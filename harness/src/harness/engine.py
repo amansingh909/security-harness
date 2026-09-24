@@ -122,13 +122,28 @@ def render_report(finding_path: str) -> dict:
     }
 
 
+def _humanize_evidence(evidence: dict) -> dict:
+    """Return a copy of a finding dict with only its NARRATIVE fields de-AI'd.
+
+    Humanizes summary / impact / remediation; leaves reproduction steps,
+    request/response, observed_result, and CVSS byte-for-byte — the humanizer
+    never gets a second chance to touch evidence.
+    """
+    from .humanizer import humanize
+
+    out = dict(evidence)
+    for field in ("summary", "impact", "remediation"):
+        if out.get(field):
+            out[field] = humanize(out[field])
+    return out
+
+
 def draft_report(finding: dict) -> str:
     """Render a submittable Markdown report from a VERIFIED finding, prose humanized.
 
-    Builds a bounty_reporter Finding (which refuses missing or blank evidence),
-    humanizes only the narrative fields — summary / impact / remediation — and
-    never the reproduction steps, request/response, or CVSS, then renders
-    Markdown. Raises ValueError if the finding lacks real evidence.
+    Builds a bounty_reporter Finding (which refuses missing or blank evidence)
+    from the humanized finding, then renders Markdown. Raises ValueError if the
+    finding lacks real evidence.
     """
     try:
         from bounty_reporter.generator import generate
@@ -138,15 +153,49 @@ def draft_report(finding: dict) -> str:
             "bounty-reporter not installed. Run: pip install -e ../bounty-reporter"
         ) from exc
 
-    from .humanizer import humanize
-
-    model = Finding.from_dict(finding)  # raises if evidence is missing/blank
-    if model.summary:
-        model.summary = humanize(model.summary)
-    model.impact = humanize(model.impact)
-    if model.remediation:
-        model.remediation = humanize(model.remediation)
+    model = Finding.from_dict(_humanize_evidence(finding))
     return generate(model).markdown
+
+
+def submit_finding(
+    evidence: dict,
+    program: str,
+    *,
+    h1_key: str | None = None,
+    bc_key: str | None = None,
+    h1_identifier: str | None = None,
+) -> dict:
+    """Submit ONE verified finding to the program(s), prose humanized.
+
+    Humanizes the narrative fields, refuses up front if the evidence is missing
+    or blank (so nothing unverified is ever sent), writes a one-item batch and
+    POSTs it through the anti-fabrication uploader. Returns the uploader's
+    ``{hackerone, bugcrowd}`` result.
+    """
+    try:
+        from bounty_reporter.models import Finding
+        from bounty_reporter.uploader import upload_report
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise ComponentMissing(
+            "bounty-reporter not installed. Run: pip install -e ../bounty-reporter"
+        ) from exc
+
+    import json
+    import os as _os
+    import tempfile
+
+    humanized = _humanize_evidence({**evidence, "program": program})
+    Finding.from_dict(humanized)  # raises ValueError if evidence is missing/blank
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as fh:
+        json.dump({"vulnerabilities": [humanized]}, fh)
+        path = fh.name
+    try:
+        return upload_report(path, program, h1_key, bc_key, h1_identifier)
+    finally:
+        _os.unlink(path)
 
 
 def available() -> dict[str, bool]:

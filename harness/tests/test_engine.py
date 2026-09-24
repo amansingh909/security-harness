@@ -82,3 +82,48 @@ def test_draft_report_refuses_a_finding_without_evidence():
     pytest.importorskip("bounty_reporter")
     with pytest.raises(ValueError):
         engine.draft_report({"program": "p", "vuln_type": "X", "asset": "a"})
+
+
+_VERIFIED_EVIDENCE = {
+    "vuln_type": "IDOR",
+    "asset": "https://app.acme.com/api/invoices/{id}",
+    "steps_to_reproduce": ["make two accounts", "GET /api/invoices/4021"],
+    "observed_result": "User B's invoice returned under User A's session.",
+    "impact": "Any user can read any invoice by id.",
+}
+
+
+def test_submit_finding_humanizes_prose_and_posts_the_verified_finding(monkeypatch):
+    pytest.importorskip("bounty_reporter")
+    import harness.humanizer as hz
+    monkeypatch.setattr(hz, "humanize", lambda text, **k: f"H:{text}")
+
+    captured = {}
+    import bounty_reporter.uploader as up
+
+    def fake_upload(path, program, h1, bc, h1_id=None):
+        import json
+        captured["data"] = json.load(open(path))
+        captured["program"] = program
+        captured["h1"], captured["bc"], captured["h1_id"] = h1, bc, h1_id
+        return {"hackerone": {"sent": 1, "failed": 0, "errors": []},
+                "bugcrowd": {"sent": 0, "failed": 0, "errors": []}}
+    monkeypatch.setattr(up, "upload_report", fake_upload)
+
+    result = engine.submit_finding(_VERIFIED_EVIDENCE, "acme",
+                                   h1_key="k", h1_identifier="id")
+
+    v = captured["data"]["vulnerabilities"][0]
+    assert v["impact"] == "H:Any user can read any invoice by id."   # humanized
+    assert v["observed_result"] == "User B's invoice returned under User A's session."  # untouched
+    assert v["steps_to_reproduce"] == ["make two accounts", "GET /api/invoices/4021"]
+    assert captured["program"] == "acme"
+    assert captured["h1"] == "k" and captured["h1_id"] == "id"
+    assert result["hackerone"]["sent"] == 1
+
+
+def test_submit_finding_refuses_missing_evidence():
+    pytest.importorskip("bounty_reporter")
+    with pytest.raises(ValueError):
+        engine.submit_finding({"vuln_type": "X", "asset": "a"}, "acme",
+                              h1_key="k", h1_identifier="id")
