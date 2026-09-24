@@ -76,6 +76,15 @@ flowchart TD
 `cve-index` is the hub: the classifier trains on it, recon correlates
 fingerprints against it, and the reporter can verify CVE references against it.
 
+## Running it autonomously (agents)
+
+An agent (or cron) driving the whole loop unattended follows
+[`AGENTS.md`](AGENTS.md) — the operator playbook: read a program's requirements
+(`harness show-policy`), configure the harness to meet them (`harness
+import-scope`, `harness set-header`), run it (`harness auto`), and triage what to
+look for — with the bright lines it must never cross (real programs stay passive,
+required headers must be set, never auto-submit).
+
 ## End-to-end run
 
 ### 1. Stand up the CVE knowledge base (the one real service)
