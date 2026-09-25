@@ -62,6 +62,13 @@ def test_prompt_screen_takes_its_constructor_arguments():
 
 @pytest.mark.asyncio
 async def test_triage_opens_and_closes():
+    from harness.programs import Program, Registry
+    from harness.paths import ensure_dirs, programs_file
+    ensure_dirs()
+    reg = Registry()
+    reg.add(Program(name="t", in_scope=["*.t.test"], seeds=["t.test"]))
+    reg.save(programs_file())
+
     app = HarnessApp()
     async with app.run_test() as pilot:
         await pilot.press("t")
@@ -92,6 +99,18 @@ async def test_auto_open_triage_env_var(monkeypatch):
     # The flag is consumed so a second app in the same process is unaffected.
     import os
     assert "HARNESS_AUTO_OPEN_TRIAGE" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_auto_open_findings_env_var(monkeypatch):
+    """A launch can drop straight into the review queue via HARNESS_AUTO_OPEN_FINDINGS."""
+    monkeypatch.setenv("HARNESS_AUTO_OPEN_FINDINGS", "1")
+    app = HarnessApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, FindingsScreen)
+    import os
+    assert "HARNESS_AUTO_OPEN_FINDINGS" not in os.environ
 
 
 def test_relative_imports_resolve():

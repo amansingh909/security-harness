@@ -590,6 +590,9 @@ class HarnessApp(App[None]):
         # leaves the modal on top while focus stays on the main screen.
         if os.environ.pop("HARNESS_AUTO_OPEN_TRIAGE", None) == "1":
             self.call_after_refresh(lambda: self.push_screen(TriageScreen(self.registry)))
+        # Lets a launch (or an agent) drop straight into the review queue.
+        if os.environ.pop("HARNESS_AUTO_OPEN_FINDINGS", None) == "1":
+            self.call_after_refresh(lambda: self.push_screen(FindingsScreen(self.registry)))
 
     def action_findings(self) -> None:
         """Open the review queue: every finding across all programs."""
