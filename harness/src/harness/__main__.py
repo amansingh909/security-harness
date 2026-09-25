@@ -792,6 +792,58 @@ def _cmd_show_policy(args: argparse.Namespace) -> None:
     print(_fetch_h1_policy(args.handle, identifier, token) or "(no policy returned)")
 
 
+def _cmd_outcome(args: argparse.Namespace) -> None:
+    """Record a program's verdict on a finding — the label the learning loop uses."""
+    ensure_dirs()
+    record = findings_store.record_outcome(
+        args.program, args.finding_id, args.verdict, args.bounty or 0.0)
+    if record is None:
+        raise SystemExit(f"no finding {args.finding_id!r} in program {args.program!r}")
+    extra = f" (${args.bounty:g})" if args.bounty else ""
+    print(f"recorded: {args.program}/{args.finding_id} -> {args.verdict}{extra}")
+
+
+def _render_lessons(summary: dict, weights: dict) -> str:
+    lines = ["# Lessons — learned from finding outcomes (auto-generated)", ""]
+    lines.append(f"Total bounty recorded: ${summary['total_bounty']:g}")
+    lines += ["", "## Signal types, ranked by learned value",
+              "positive = has led to valid/paid bugs; negative = wastes your time", ""]
+    ranked = sorted(summary["by_signal"].items(),
+                    key=lambda kv: weights.get(kv[0], 0.0), reverse=True)
+    if not ranked:
+        lines.append("- (no verdicts yet — mark findings, then `harness outcome ...`)")
+    for signal_t, c in ranked:
+        w = weights.get(signal_t, 0.0)
+        lines.append(f"- **{signal_t}**: weight {w:+.2f} — paid {c['paid']}, "
+                     f"valid {c['valid']}, wasted {c['wasted']}, pending {c['pending']}")
+    lines += ["", "## Programs, by bounty earned"]
+    for prog, c in sorted(summary["by_program"].items(),
+                          key=lambda kv: kv[1]["bounty"], reverse=True):
+        lines.append(f"- **{prog}**: ${c['bounty']:g} — paid {c['paid']}, "
+                     f"valid {c['valid']}, wasted {c['wasted']}, pending {c['pending']}")
+    lines += ["", "## How to use this",
+              "- Spend time on the high-weight signal types; skip the negative ones.",
+              "- The review queue already re-ranks new leads by these weights.",
+              "- Re-run `harness lessons` after each review to refresh it."]
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_lessons(args: argparse.Namespace) -> None:
+    """Summarize what has paid off vs. wasted time; write ~/.harness/lessons.md."""
+    from . import learning
+
+    registry = Registry.load(programs_file())
+    records: list = []
+    for name in registry.names():
+        records.extend(findings_store.load_findings(name))
+    text = _render_lessons(learning.summarize(records), learning.signal_weights(records))
+    print(text)
+    path = config_dir() / "lessons.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(f"(written to {path})")
+
+
 async def _refresh_h1_scopes(registry: Registry, names: list[str]) -> None:
     """Re-pull each HackerOne-imported program's scope from the API before a run.
 
@@ -980,6 +1032,22 @@ def main() -> None:
     )
     p_pol.add_argument("handle", help="HackerOne program handle, e.g. clear")
     p_pol.set_defaults(func=_cmd_show_policy)
+
+    # ── The learning loop: record verdicts, see what pays ─────────────────────
+    p_out = sub.add_parser(
+        "outcome",
+        help="record a program's verdict on a finding (the learning label)")
+    p_out.add_argument("program")
+    p_out.add_argument("finding_id")
+    p_out.add_argument("verdict",
+                       help="triaged | duplicate | n-a | informative | resolved | paid")
+    p_out.add_argument("--bounty", type=float, default=0.0, help="$ awarded, if any")
+    p_out.set_defaults(func=_cmd_outcome)
+
+    p_les = sub.add_parser(
+        "lessons",
+        help="what has paid off vs wasted time (writes ~/.harness/lessons.md)")
+    p_les.set_defaults(func=_cmd_lessons)
 
     # ── HackerOne scope import ────────────────────────────────────────────────
     p_scope = sub.add_parser(

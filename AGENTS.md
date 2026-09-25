@@ -128,6 +128,37 @@ verifying real-program leads by hand.
 
 ---
 
+## 6. Learn as you go (the feedback loop)
+
+The harness gets better the more you tell it what happened. This is a feedback
+loop, not model training — but it's the same idea, and the recorded outcomes are
+exactly what you'd train a real lead-quality model on later.
+
+**Before a run:** read `~/.harness/lessons.md` (written by `harness lessons`). It
+ranks which **signal types** and **programs** have paid off vs. which only waste
+time. Lead with the high-weight ones; skip the negative ones.
+
+**After the human reviews, or a program responds:** record the verdict — this is
+the label the loop learns from (marks are also set live in the TUI):
+```
+harness outcome <program> <finding_id> real
+harness outcome <program> <finding_id> triaged
+harness outcome <program> <finding_id> duplicate
+harness outcome <program> <finding_id> n-a                 # wasted time
+harness outcome <program> <finding_id> paid --bounty 750
+```
+
+**Then refresh the lessons:**
+```
+harness lessons        # prints the summary + rewrites ~/.harness/lessons.md
+```
+The review queue **automatically re-ranks new leads** by these learned weights,
+folding in all three goals at once — **paid > valid > time-wasted**. Signal
+types that led to valid/paid bugs float to the top; ones that came back false or
+N/A sink. **No verdicts recorded = no learning**, so always record them.
+
+---
+
 ## Worked example — CLEAR (a program that requires a header)
 
 ```

@@ -40,6 +40,8 @@ class FindingRecord(BaseModel):
     priority_score: int = 0
     status: FindingStatus = "needs_check"
     evidence: dict = Field(default_factory=dict)   # operator-verified: vuln_type/steps/…
+    outcome: str = ""      # program verdict after submit: triaged/duplicate/n-a/resolved/paid
+    bounty: float = 0.0    # $ awarded, if any — feeds the learning loop
     note: str = ""
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
@@ -138,6 +140,21 @@ def update_status(
     record.status = status
     if note is not None:
         record.note = note
+    record.updated_at = _now()
+    save_finding(record)
+    return record
+
+
+def record_outcome(
+    program: str, fid: str, outcome: str, bounty: float = 0.0
+) -> FindingRecord | None:
+    """Record the program's verdict on a finding — the label the learning loop uses."""
+    record = get_finding(program, fid)
+    if record is None:
+        return None
+    record.outcome = outcome
+    if bounty:
+        record.bounty = bounty
     record.updated_at = _now()
     save_finding(record)
     return record

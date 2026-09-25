@@ -97,7 +97,8 @@ def test_every_subcommand_handler_exists():
     for handler in ("_cmd_tui", "_cmd_list", "_cmd_add", "_cmd_add_prog",
                     "_cmd_hunt", "_cmd_scan", "_cmd_global", "_cmd_up",
                     "_cmd_down", "_cmd_auto", "_cmd_seed_practice",
-                    "_cmd_set_header", "_cmd_show_policy"):
+                    "_cmd_set_header", "_cmd_show_policy",
+                    "_cmd_outcome", "_cmd_lessons"):
         assert callable(getattr(cli, handler, None)), f"{handler} missing"
 
 
@@ -462,6 +463,7 @@ def test_auto_runs_only_the_requested_programs(tmp_path, monkeypatch):
 # --- auto-refresh HackerOne scope so a run never uses stale scope -------------
 
 def test_refresh_h1_scopes_updates_imported_program_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))  # never touch the real config
     monkeypatch.setenv("H1_IDENTIFIER", "id")
     monkeypatch.setenv("H1_API_KEY", "key")
     from harness.programs import Program, Registry
@@ -485,7 +487,8 @@ def test_refresh_h1_scopes_updates_imported_program_only(tmp_path, monkeypatch):
     assert reg.get("manual").in_scope == ["m.com"]          # no handle -> untouched
 
 
-def test_refresh_h1_scopes_keeps_saved_scope_on_failure(monkeypatch):
+def test_refresh_h1_scopes_keeps_saved_scope_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))  # never touch the real config
     monkeypatch.setenv("H1_IDENTIFIER", "id")
     monkeypatch.setenv("H1_API_KEY", "key")
     from harness.programs import Program, Registry
@@ -502,7 +505,8 @@ def test_refresh_h1_scopes_keeps_saved_scope_on_failure(monkeypatch):
     assert reg.get("acme").in_scope == ["saved.acme.com"]   # kept, no crash
 
 
-def test_refresh_h1_scopes_without_creds_is_noop(monkeypatch):
+def test_refresh_h1_scopes_without_creds_is_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))  # never touch the real config
     monkeypatch.delenv("H1_IDENTIFIER", raising=False)
     monkeypatch.delenv("H1_API_KEY", raising=False)
     from harness.programs import Program, Registry

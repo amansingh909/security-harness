@@ -119,6 +119,16 @@ def test_record_from_lead_id_is_stable_per_host(tmp_path, monkeypatch):
     assert a.id == b.id  # a re-run updates the same host in place
 
 
+def test_record_outcome_persists_verdict_and_bounty(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    rec = fs.record_from_lead("clear", LEAD)
+    fs.save_finding(rec)
+    fs.record_outcome("clear", rec.id, "paid", bounty=750.0)
+    got = fs.get_finding("clear", rec.id)
+    assert got.outcome == "paid"
+    assert got.bounty == 750.0
+
+
 def test_set_evidence_persists_and_survives_a_rescan(tmp_path, monkeypatch):
     monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
     rec = fs.record_from_lead("acme", LEAD)

@@ -24,7 +24,7 @@ import os
 
 from rich.text import Text
 
-from .. import engine, findings_store, store
+from .. import engine, findings_store, learning, store
 from ..findings import finding_template
 from ..findings_store import FindingRecord
 from ..paths import ensure_dirs, hunts_dir, programs_file
@@ -322,8 +322,12 @@ def collect_findings(registry: Registry) -> list[FindingRecord]:
     out: list[FindingRecord] = []
     for prog_name in registry.names():
         out.extend(findings_store.load_findings(prog_name))
+    # Rank within a status group by the LEARNED value of each finding's signals,
+    # so the queue gets better as outcomes accumulate (falls back to base
+    # priority when there's no history yet).
+    weights = learning.signal_weights(out)
     order = {"needs_check": 0, "ready": 1, "real": 2, "duplicate": 3, "false": 4}
-    out.sort(key=lambda r: (order.get(r.status, 9), -r.priority_score))
+    out.sort(key=lambda r: (order.get(r.status, 9), -learning.learned_score(r, weights)))
     return out
 
 
