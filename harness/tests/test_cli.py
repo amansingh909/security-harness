@@ -387,6 +387,79 @@ def test_cmd_auto_fills_review_queue_without_prompts(tmp_path, monkeypatch):
     assert any("/info.php" in s for s in recs[0].signals)
 
 
+def test_auto_continues_to_recon_when_cve_index_cannot_start(tmp_path, monkeypatch):
+    """cve-index only *enriches* leads. If it can't come up (e.g. no docker in
+    the sandbox), `auto` must still run recon and fill the queue — never abort.
+    Regression: `_cmd_auto` used to `return` on any cve-index failure, so a
+    passive run in the sandbox produced nothing."""
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="acme", in_scope=["*.acme.com"], seeds=["www.acme.com"]))
+    reg.save(tmp_path / "programs.yaml")
+
+    async def _boom(*a, **k):
+        raise RuntimeError("cve-index service did not become healthy within 30s")
+
+    async def _ok(*a, **k):
+        return None
+    monkeypatch.setattr(cli, "_ensure_cve_index_running", _boom)
+    monkeypatch.setattr(cli, "_ensure_cve_corpus", _ok)
+    monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
+
+    async def fake_pipeline(registry, names):
+        for name in names:
+            cli.store.save_leads(name, [{
+                "host": "dev.acme.com", "url": "http://dev.acme.com",
+                "signals": ["auth boundary (403) at /admin — access-control lead"],
+                "fingerprints": [], "cve_candidates": [],
+                "priority_score": 20, "status": 403,
+            }])
+    monkeypatch.setattr(cli, "_run_pipeline", fake_pipeline)
+
+    cli._cmd_auto(argparse.Namespace())
+
+    from harness import findings_store as fs
+    recs = fs.load_findings("acme")
+    assert [r.host for r in recs] == ["dev.acme.com"]  # recon still filled the queue
+
+
+def test_auto_skips_cve_index_when_env_flag_set(tmp_path, monkeypatch):
+    """The sandbox has no docker and sets HARNESS_SKIP_CVE_INDEX; `auto` must not
+    even attempt to start cve-index, yet still run recon into the queue."""
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    monkeypatch.setenv("HARNESS_SKIP_CVE_INDEX", "1")
+
+    from harness.programs import Program, Registry
+    reg = Registry()
+    reg.add(Program(name="acme", in_scope=["*.acme.com"], seeds=["www.acme.com"]))
+    reg.save(tmp_path / "programs.yaml")
+
+    async def _must_not_run(*a, **k):
+        raise AssertionError("auto must not touch cve-index when the skip flag is set")
+    monkeypatch.setattr(cli, "_ensure_cve_index_running", _must_not_run)
+    monkeypatch.setattr(cli, "_ensure_cve_corpus", _must_not_run)
+    monkeypatch.setattr(cli, "_teardown_services", lambda **k: None)
+
+    async def fake_pipeline(registry, names):
+        for name in names:
+            cli.store.save_leads(name, [{
+                "host": "dev.acme.com", "url": "http://dev.acme.com",
+                "signals": ["version disclosed (nginx/1.18.0) — CVE surface"],
+                "fingerprints": [], "cve_candidates": [],
+                "priority_score": 5, "status": 200,
+            }])
+    monkeypatch.setattr(cli, "_run_pipeline", fake_pipeline)
+
+    cli._cmd_auto(argparse.Namespace())
+
+    from harness import findings_store as fs
+    assert [r.host for r in fs.load_findings("acme")] == ["dev.acme.com"]
+
+
 # --- practice vs real: the bright line, enforced ------------------------------
 #
 # In an autonomous run a REAL program is always passive (GET/HEAD) — it never

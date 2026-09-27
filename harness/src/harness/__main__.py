@@ -904,14 +904,23 @@ def _cmd_auto(args: argparse.Namespace) -> None:
     runs with its own settings; a real program stays passive (GET/HEAD) unless it
     was explicitly armed, so this never sends attack traffic or submits anything.
     """
-    print("→ preparing cve-index services…")
-    try:
-        asyncio.run(_ensure_cve_index_running())
-        asyncio.run(_ensure_cve_corpus())
-    except Exception as exc:
-        print(f"❌ could not prepare cve-index: {exc}")
-        _teardown_services(stop_zap=False, only_if_owned=True)
-        return
+    # cve-index (docker + Elasticsearch) only *enriches* recon leads with known
+    # CVEs; the review queue is built from the leads themselves (below), so a
+    # missing cve-index must never abort a run. It is therefore optional: the
+    # sandbox has no docker and sets HARNESS_SKIP_CVE_INDEX to skip it outright,
+    # and otherwise we degrade gracefully to recon-only if it can't come up.
+    if os.environ.get("HARNESS_SKIP_CVE_INDEX"):
+        print("→ cve-index skipped (HARNESS_SKIP_CVE_INDEX) — recon only, "
+              "no version→CVE enrichment.")
+    else:
+        print("→ preparing cve-index services…")
+        try:
+            asyncio.run(_ensure_cve_index_running())
+            asyncio.run(_ensure_cve_corpus())
+        except Exception as exc:
+            print(f"⚠️  cve-index unavailable ({exc}); continuing with recon "
+                  f"only — version→CVE enrichment skipped.")
+            _teardown_services(stop_zap=False, only_if_owned=True)
 
     try:
         registry = Registry.load(programs_file())
