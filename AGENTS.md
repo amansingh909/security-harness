@@ -101,6 +101,9 @@ The interesting leads need **manual active testing** to confirm on a real
 program — that is the human's job. **You do not exploit real programs.** Leave the
 lead + its signals in the queue; the human takes it from there.
 
+The human's active-testing kit (tools, commands, payloads for the by-hand phase,
+for authorized targets only) is in `docs/manual-toolbox.md`.
+
 ---
 
 ## 4. Hand off to the human
