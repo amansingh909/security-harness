@@ -1001,6 +1001,49 @@ def _cmd_dedup(args: argparse.Namespace) -> None:
         print(f"       {r.url}  {when}  votes={r.votes}")
 
 
+def _cmd_autopilot(args: argparse.Namespace) -> None:
+    """Autopilot (experimental): run the active pass, then draft each CONFIRMED
+    active-test finding from an ARMED program (mode=practice) into a per-program
+    playbook. It never submits, and it never drafts a real (passive) program.
+    Confirming and submitting stay with you.
+    """
+    from . import autopilot, engine, findings_store
+
+    # 1. Fill the queue. Real programs stay passive; armed programs are actively
+    #    tested. Same safety posture as `harness auto`.
+    _cmd_auto(args)
+
+    # 2. Draft the confirmed active-test findings from armed programs only.
+    registry = Registry.load(programs_file())
+    names = registry.names()
+    requested = getattr(args, "programs", None)
+    if requested:
+        wanted = {n.strip() for n in requested.split(",") if n.strip()}
+        names = [n for n in names if n in wanted]
+
+    print("-> autopilot: drafting confirmed active-test findings (never submits)")
+    total = 0
+    for name in names:
+        prog = registry.get(name)
+        if not prog or prog.mode != "practice":
+            continue  # only programs armed for active testing are auto-drafted
+        pb = autopilot.playbook_dir(name)
+        for rec in findings_store.load_findings(name):
+            for i, ev in enumerate(autopilot.drafts_for(rec)):
+                try:
+                    md = engine.draft_report({**ev, "program": name})
+                except Exception as exc:  # noqa: BLE001 - a bad draft must not stop the rest
+                    print(f"  {name}/{rec.id}: draft skipped ({exc})")
+                    continue
+                (pb / f"{rec.id}-{i}.md").write_text(md, encoding="utf-8")
+                findings_store.set_evidence(name, rec.id, ev)
+                total += 1
+                print(f"  {name}: {ev['vuln_type']} in '{ev['affected_param']}' "
+                      f"-> playbook/{rec.id}-{i}.md")
+    print(f"autopilot drafted {total} report(s). Review ~/hunts/<program>/playbook/ "
+          f"and submit yourself.")
+
+
 def main() -> None:
     _load_env_file()
     parser = argparse.ArgumentParser(prog="harness",
@@ -1101,6 +1144,13 @@ def main() -> None:
     p_dedup.add_argument("query", nargs="*",
                          help="keywords (default: derived from the program's findings)")
     p_dedup.set_defaults(func=_cmd_dedup)
+
+    p_ap = sub.add_parser(
+        "autopilot",
+        help="EXPERIMENTAL: active pass + draft confirmed active-test findings "
+             "(armed programs only; never submits)")
+    p_ap.add_argument("--programs", help="comma-separated subset of programs")
+    p_ap.set_defaults(func=_cmd_autopilot)
 
     # ── HackerOne scope import ────────────────────────────────────────────────
     p_scope = sub.add_parser(
