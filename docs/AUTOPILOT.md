@@ -9,8 +9,8 @@ against real programs expecting it to close bugs for you.
 
 The machine never sends attack traffic to a real third-party program unattended,
 and it never auto-submits to a platform. Those two behaviors are what get a
-HackerOne or Bugcrowd account banned and create real legal exposure, which is the
-opposite of making money. On a real program, the human still runs the one manual
+HackerOne or Bugcrowd account banned and create real legal exposure. On a real
+program, the human still runs the one manual
 active test and still presses submit. That guardrail is the difference between an
 aggressive research branch and an account-ending liability.
 
@@ -22,9 +22,9 @@ Everything short of those two, autopilot automates as far as it will go.
 On `mode=practice` targets (intentionally vulnerable sites you own or are meant
 to exploit: vulnweb, a local Juice Shop or DVWA), autopilot runs the whole loop
 by itself: recon, active exploitation, confirm the bug, capture the
-request/response evidence, and draft the report. This is the only place "prints
-money on its own" is safe to realize end to end, because there is no third party
-to harm. The value is a proven repro library the human replays by hand on real
+request/response evidence, and draft the report. This is the only place the full
+loop can run end to end unattended, because there is no third party to harm. The
+value is a proven repro library the human replays by hand on real
 leads.
 
 ### Real programs: prepare everything up to the submit
@@ -39,7 +39,7 @@ ready-to-submit package so the human's job shrinks to review plus one click:
    what they actually observed.
 
 The machine prepares; the human confirms and submits. This attacks the real
-bottleneck to money (the per-lead human time) without the machine itself
+bottleneck (the per-lead human time) without the machine itself
 touching a real target unattended.
 
 ## Why it is isolated
