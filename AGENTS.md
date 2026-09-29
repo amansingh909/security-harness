@@ -113,6 +113,16 @@ Reviews the queue, opens a lead (Enter), adds the evidence they verified by hand
 previews the humanized report (Ctrl+D), and submits (Ctrl+S). **Only the human
 submits.**
 
+**Before you submit, dedup.** Check the finding against HackerOne's public
+disclosures so you do not file a known duplicate:
+```
+harness dedup <program>                  # keywords derived from the queue
+harness dedup <program> idor account     # or your own keywords
+```
+Read-only and best-effort: the API cannot filter by program server-side, so it
+seeds the program handle into a relevance search and scopes to the program
+client-side. Treat any hit as "verify by hand," never as a verdict.
+
 ---
 
 ## 5. Practice mode (safe autonomous exploitation)

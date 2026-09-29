@@ -965,6 +965,42 @@ def _cmd_tui(args: argparse.Namespace) -> None:
     _offer_service_teardown()
 
 
+def _cmd_dedup(args: argparse.Namespace) -> None:
+    """Check a program's finding against HackerOne's public disclosures.
+
+    Read-only. Surfaces already-disclosed reports so a known duplicate is not
+    submitted. With no query, keywords are derived from the program's findings.
+    """
+    from . import dedup
+    identifier = os.getenv("H1_IDENTIFIER")
+    token = os.getenv("H1_API_KEY")
+    if not (identifier and token):
+        print("set H1_IDENTIFIER and H1_API_KEY in ~/.harness/.env to use dedup")
+        return
+    query = " ".join(args.query).strip() if args.query else ""
+    if not query:
+        from . import findings_store as fs
+        parts: list[str] = []
+        for rec in fs.load_findings(args.program)[:6]:
+            parts.extend(rec.signals or [])
+            if rec.host:
+                parts.append(rec.host)
+        query = dedup.keywords_for(*parts) if parts else args.program
+    print(f"→ disclosed-report check for {args.program!r}  query={query!r}")
+    matches = dedup.dedup_candidates(args.program, query,
+                                     identifier=identifier, token=token)
+    if not matches:
+        print("  no matching public disclosures found "
+              "(best-effort keyword check, not a guarantee; still verify by hand).")
+        return
+    print(f"  {len(matches)} possible public duplicate(s), check before submitting:")
+    for r in matches:
+        sev = f"[{r.severity}]" if r.severity else ""
+        when = (r.disclosed_at or "")[:10]
+        print(f"   * {r.title[:72]} {sev}")
+        print(f"       {r.url}  {when}  votes={r.votes}")
+
+
 def main() -> None:
     _load_env_file()
     parser = argparse.ArgumentParser(prog="harness",
@@ -1057,6 +1093,14 @@ def main() -> None:
         "lessons",
         help="what has paid off vs wasted time (writes ~/.harness/lessons.md)")
     p_les.set_defaults(func=_cmd_lessons)
+
+    p_dedup = sub.add_parser(
+        "dedup",
+        help="check a program's finding against HackerOne public disclosures")
+    p_dedup.add_argument("program")
+    p_dedup.add_argument("query", nargs="*",
+                         help="keywords (default: derived from the program's findings)")
+    p_dedup.set_defaults(func=_cmd_dedup)
 
     # ── HackerOne scope import ────────────────────────────────────────────────
     p_scope = sub.add_parser(
