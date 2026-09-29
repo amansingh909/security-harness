@@ -64,8 +64,12 @@ class HttpProber:
             max_keepalive_connections=settings.max_concurrency,
         )
         timeout = httpx.Timeout(settings.http_timeout, connect=settings.connect_timeout)
+        # Extra headers (e.g. a Vercel protection-bypass token) go on every
+        # request the prober makes — passive probes and the built-in tester.
+        headers = {"User-Agent": settings.user_agent}
+        headers.update(settings.extra_request_headers or {})
         self._client = httpx.AsyncClient(
-            headers={"User-Agent": settings.user_agent},
+            headers=headers,
             timeout=timeout,
             limits=limits,
             verify=settings.verify_tls,
@@ -74,6 +78,16 @@ class HttpProber:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def send(self, request):
+        """Send an arbitrary request through the shared rate limiter.
+
+        Active testing needs to issue custom requests but must not bypass the
+        token bucket — the politeness guarantee applies to every request, not
+        just the passive probes.
+        """
+        await self._bucket.acquire()
+        return await self._client.send(request)
 
     async def probe(self, host: str) -> HostProbe:
         import httpx

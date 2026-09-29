@@ -7,23 +7,26 @@ from pathlib import Path
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
     Input,
     Label,
     Static,
+    TextArea,
 )
 import os
 
 from rich.text import Text
 
-from .. import engine, store
+from .. import engine, findings_store, learning, store
 from ..findings import finding_template
+from ..findings_store import FindingRecord
 from ..paths import ensure_dirs, hunts_dir, programs_file
 from ..programs import Program, Registry
 
@@ -67,6 +70,8 @@ class AddProgramScreen(ModalScreen[dict | None]):
             yield Input(placeholder="in-scope, comma sep (e.g. *.acme.com)", id="f-in")
             yield Input(placeholder="out-of-scope, comma sep (optional)", id="f-out")
             yield Input(placeholder="seeds, comma sep (optional)", id="f-seeds")
+            yield Checkbox("Active testing — OWNED ASSETS ONLY", id="f-active")
+            yield Checkbox("Use OWASP ZAP engine (needs active testing)", id="f-zap")
             with Horizontal(id="dialog-buttons"):
                 yield Button("Save", variant="primary", id="save")
                 yield Button("Cancel", id="cancel")
@@ -76,11 +81,18 @@ class AddProgramScreen(ModalScreen[dict | None]):
             self.dismiss(None)
             return
 
+        # ZAP implies active testing; active testing must be explicit.
+        active = self.query_one("#f-active", Checkbox).value
+        use_zap = self.query_one("#f-zap", Checkbox).value
+        if use_zap:
+            active = True
+
         # A handle takes the import path; the manual fields are ignored so the
         # two ways of adding a program never fight over the same submit.
         handle = self.query_one("#f-handle", Input).value.strip()
         if handle:
-            self.dismiss({"import_handle": handle})
+            self.dismiss({"import_handle": handle,
+                          "active_tests": active, "use_zap": use_zap})
             return
 
         name = self.query_one("#f-name", Input).value.strip()
@@ -102,6 +114,8 @@ class AddProgramScreen(ModalScreen[dict | None]):
             # rarely changed and stay editable in programs.yaml for the odd case.
             "seeds_file": None,
             "cve_index_url": DEFAULT_CVE_URL,
+            "active_tests": active,
+            "use_zap": use_zap,
         })
 
     def action_cancel(self) -> None:
@@ -198,8 +212,13 @@ class HelpScreen(ModalScreen[None]):
 [b]Programs[/b]              [b]Per lead[/b]
   a  add / import H1      s  search the CVE index
   i  import H1 scope      c  classify a description
-  d  delete (confirms)    w  scaffold a report
-  n  nightly: all progs   e  render a report
+  z  active/ZAP mode      w  scaffold a report
+  d  delete (confirms)    e  render a report
+  n  nightly: all progs
+
+[b]Active testing[/b] (OWNED ASSETS ONLY) — [b]z[/b] cycles a program
+  off -> active (built-in) -> active + ZAP -> off. Then [b]r[/b] recon runs
+  it; ZAP findings land in the leads/triage. ZAP creds come from ~/.harness/.env.
 
 [b]Anywhere[/b]
   t  triage      u  upload      q  quit      ?  this help
@@ -281,6 +300,235 @@ class TriageScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+def _status_cell(status: str) -> Text:
+    """Colour a finding's status so the review queue reads as a worklist."""
+    styles = {
+        "needs_check": "bold yellow",
+        "ready": "bold green",
+        "real": "bold red",
+        "false": "dim",
+        "duplicate": "dim",
+    }
+    return Text(status, style=styles.get(status, ""))
+
+
+def collect_findings(registry: Registry) -> list[FindingRecord]:
+    """Every stored finding across all programs, ordered as a triage worklist.
+
+    A fresh finding still needing a human sits at the top; one already ruled
+    real / false / duplicate sinks below it. Within a status, higher priority
+    comes first.
+    """
+    out: list[FindingRecord] = []
+    for prog_name in registry.names():
+        out.extend(findings_store.load_findings(prog_name))
+    # Rank within a status group by the LEARNED value of each finding's signals,
+    # so the queue gets better as outcomes accumulate (falls back to base
+    # priority when there's no history yet).
+    weights = learning.signal_weights(out)
+    order = {"needs_check": 0, "ready": 1, "real": 2, "duplicate": 3, "false": 4}
+    out.sort(key=lambda r: (order.get(r.status, 9), -learning.learned_score(r, weights)))
+    return out
+
+
+class FindingDetailScreen(ModalScreen[None]):
+    """Verify a finding, draft its humanized report, and submit it.
+
+    Fill in the evidence a passive scan can't know — what you confirmed by hand —
+    then Ctrl+D to preview the humanized report, Ctrl+S to submit (twice, to
+    confirm). Nothing is submitted without your keypress, and the uploader
+    refuses anything missing real evidence.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Back"),
+        Binding("ctrl+d", "draft", "Draft report"),
+        Binding("ctrl+s", "submit", "Submit"),
+    ]
+
+    def __init__(self, record: FindingRecord) -> None:
+        super().__init__()
+        self.record = record
+        self._confirm = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        ev = self.record.evidence or {}
+        with VerticalScroll():
+            signals = "\n".join(f"• {s}" for s in (self.record.signals or [])) or "—"
+            yield Static(
+                f"[b]{self.record.host}[/b]  {self.record.url}\n"
+                f"[dim]what recon saw:[/dim]\n{signals}",
+                id="context",
+            )
+            yield Label("Vulnerability type")
+            yield Input(value=ev.get("vuln_type", ""), id="vuln_type",
+                        placeholder="e.g. Reflected XSS")
+            yield Label("Asset (URL / endpoint / parameter)")
+            yield Input(value=ev.get("asset", self.record.url or self.record.host),
+                        id="asset")
+            yield Label("Steps to reproduce (one per line)")
+            yield TextArea("\n".join(ev.get("steps_to_reproduce", [])), id="steps")
+            yield Label("Observed result (what you actually saw)")
+            yield Input(value=ev.get("observed_result", ""), id="observed")
+            yield Label("Impact")
+            yield Input(value=ev.get("impact", ""), id="impact")
+            yield Static("", id="preview")
+        yield Footer()
+
+    def _evidence(self) -> dict:
+        steps = [line for line in self.query_one("#steps", TextArea).text.splitlines()
+                 if line.strip()]
+        return {
+            "program": self.record.program,
+            "vuln_type": self.query_one("#vuln_type", Input).value.strip(),
+            "asset": (self.query_one("#asset", Input).value.strip()
+                      or self.record.url or self.record.host),
+            "steps_to_reproduce": steps,
+            "observed_result": self.query_one("#observed", Input).value.strip(),
+            "impact": self.query_one("#impact", Input).value.strip(),
+        }
+
+    def _persist(self, evidence: dict) -> None:
+        findings_store.set_evidence(self.record.program, self.record.id, evidence)
+
+    def _show(self, text: str) -> None:
+        self.query_one("#preview", Static).update(text)
+
+    def action_draft(self) -> None:
+        self._confirm = False
+        evidence = self._evidence()
+        self._persist(evidence)
+        try:
+            markdown = engine.draft_report(evidence)
+        except ValueError as exc:
+            self._show(f"Can't draft yet — {exc}")
+            return
+        self._show(markdown)
+
+    def action_submit(self) -> None:
+        evidence = self._evidence()
+        self._persist(evidence)
+        required = ("vuln_type", "steps_to_reproduce", "observed_result", "impact")
+        missing = [f for f in required if not evidence.get(f)]
+        if missing:
+            self._confirm = False
+            self._show("Fill in before submitting: " + ", ".join(missing))
+            return
+        if not self._confirm:
+            self._confirm = True
+            self._show(f"⚠️  Submit to program '{self.record.program}'? "
+                       "Press Ctrl+S again to confirm.")
+            return
+        self._confirm = False
+        h1_key = os.getenv("H1_API_KEY")
+        bc_key = os.getenv("BC_API_KEY")
+        if not (h1_key or bc_key):
+            self._show("No API keys set — add H1_IDENTIFIER + H1_API_KEY (or "
+                       "BC_API_KEY) to ~/.harness/.env, then submit again.")
+            return
+        try:
+            result = engine.submit_finding(
+                evidence, self.record.program,
+                h1_key=h1_key, bc_key=bc_key,
+                h1_identifier=os.getenv("H1_IDENTIFIER"),
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any submit error to the operator
+            self._show(f"Submit failed: {exc}")
+            return
+        findings_store.update_status(self.record.program, self.record.id,
+                                     "real", note="submitted")
+        self._show(f"✅ submitted. {result}")
+
+    def action_close(self) -> None:
+        self._persist(self._evidence())
+        self.dismiss(None)
+
+
+class FindingsScreen(ModalScreen[None]):
+    """The review queue: every finding across all programs, marked in place.
+
+    r / f / x mark the highlighted finding real / false / duplicate and persist
+    immediately; escape or q closes. The autonomous runner fills this queue; the
+    operator works it here instead of editing files.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("q", "cancel", "Close"),
+        Binding("r", "mark_real", "Real"),
+        Binding("f", "mark_false", "False"),
+        Binding("x", "mark_duplicate", "Dup"),
+    ]
+
+    def __init__(self, registry: Registry) -> None:
+        super().__init__()
+        self.registry = registry
+        self._ordered: list[tuple[str, str]] = []  # row index -> (program, finding id)
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield DataTable(id="findings-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        table.add_columns("Program", "Status", "Score", "Host", "Findings", "Top signal")
+        self._populate_table()
+
+    def _populate_table(self) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        table.clear()
+        self._ordered = []
+        for record in collect_findings(self.registry):
+            host = record.host or (record.service or {}).get("host", "")
+            signals = record.signals or []
+            top = signals[0] if signals else "—"
+            if len(top) > 61:
+                top = top[:60] + "…"
+            self._ordered.append((record.program, record.id))
+            table.add_row(
+                record.program,
+                _status_cell(record.status),
+                _score_cell(record.priority_score),
+                host,
+                str(len(signals)),
+                top,
+                key=record.id,
+            )
+
+    def _mark(self, status: str) -> None:
+        table = self.query_one("#findings-table", DataTable)
+        idx = table.cursor_row
+        if idx is None or idx < 0 or idx >= len(self._ordered):
+            return
+        program, fid = self._ordered[idx]
+        findings_store.update_status(program, fid, status)
+        self._populate_table()
+
+    def on_data_table_row_selected(self, event) -> None:
+        """Enter on a row opens that finding to verify, draft, and submit."""
+        row_key = event.row_key.value if event.row_key is not None else None
+        for program, fid in self._ordered:
+            if fid == row_key:
+                record = findings_store.get_finding(program, fid)
+                if record is not None:
+                    self.app.push_screen(FindingDetailScreen(record))
+                return
+
+    def action_mark_real(self) -> None:
+        self._mark("real")
+
+    def action_mark_false(self) -> None:
+        self._mark("false")
+
+    def action_mark_duplicate(self) -> None:
+        self._mark("duplicate")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HarnessApp(App[None]):
     CSS_PATH = "app.tcss"
     TITLE = "security-harness"
@@ -291,12 +539,14 @@ class HarnessApp(App[None]):
         Binding("r", "recon", "Recon"),
         Binding("v", "scan", "Scan"),
         Binding("t", "triage", "Triage"),
+        Binding("f", "findings", "Findings"),
         Binding("u", "upload", "Upload"),
         Binding("a", "add", "Add"),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("q", "quit", "Quit"),
         # hidden from the footer, discoverable via `?`
         Binding("i", "import_scope", "Import H1 scope", show=False),
+        Binding("z", "toggle_active", "Active/ZAP mode", show=False),
         Binding("n", "nightly", "Nightly run", show=False),
         Binding("s", "search", "Search CVEs", show=False),
         Binding("w", "report", "Scaffold report", show=False),
@@ -340,6 +590,13 @@ class HarnessApp(App[None]):
         # leaves the modal on top while focus stays on the main screen.
         if os.environ.pop("HARNESS_AUTO_OPEN_TRIAGE", None) == "1":
             self.call_after_refresh(lambda: self.push_screen(TriageScreen(self.registry)))
+        # Lets a launch (or an agent) drop straight into the review queue.
+        if os.environ.pop("HARNESS_AUTO_OPEN_FINDINGS", None) == "1":
+            self.call_after_refresh(lambda: self.push_screen(FindingsScreen(self.registry)))
+
+    def action_findings(self) -> None:
+        """Open the review queue: every finding across all programs."""
+        self.push_screen(FindingsScreen(self.registry))
 
     # ---- component status bar -----------------------------------------
     def _cve_url(self) -> str:
@@ -372,10 +629,18 @@ class HarnessApp(App[None]):
         table = self.query_one("#programs", DataTable)
         table.clear()
         for name in self.registry.names():
+            prog = self.registry.get(name)
             n_leads = len(store.load_leads(name))
             last = store.last_run(name)
             last_str = last.strftime("%m-%d %H:%M") if last else "-"
-            table.add_row(name, str(n_leads) if n_leads else "-", last_str, key=name)
+            # Mark active-testing programs so an armed target is never a surprise.
+            if prog and prog.use_zap:
+                label = Text.assemble(name, ("  ⚡ZAP", "bold red"))
+            elif prog and prog.active_tests:
+                label = Text.assemble(name, ("  ⚡active", "bold yellow"))
+            else:
+                label = name
+            table.add_row(label, str(n_leads) if n_leads else "-", last_str, key=name)
         if self.registry.names() and self.current_program is None:
             self.select_program(self.registry.names()[0])
 
@@ -442,7 +707,9 @@ class HarnessApp(App[None]):
                 return
             # A HackerOne handle routes to the import flow instead of a manual add.
             if "import_handle" in result:
-                self._do_import_scope(result["import_handle"])
+                self._do_import_scope(result["import_handle"],
+                                      active_tests=result.get("active_tests", False),
+                                      use_zap=result.get("use_zap", False))
                 return
             self.registry.add(Program(**result))
             self.registry.save(programs_file())
@@ -470,7 +737,8 @@ class HarnessApp(App[None]):
         )
 
     @work(exclusive=True)
-    async def _do_import_scope(self, program_handle: str) -> None:
+    async def _do_import_scope(self, program_handle: str,
+                               active_tests: bool = False, use_zap: bool = False) -> None:
         try:
             from recon_orchestrator.hackerone_scope import fetch_structured_scopes
         except ImportError:
@@ -509,11 +777,14 @@ class HarnessApp(App[None]):
             self.registry.add(Program(
                 name=program_handle, in_scope=in_scope, out_of_scope=out_scope,
                 seeds=seeds, seeds_file=None, cve_index_url=DEFAULT_CVE_URL,
+                active_tests=active_tests, use_zap=use_zap,
+                h1_handle=program_handle,
             ))
             verb = f"created with {len(seeds)} seed(s)"
         else:
             self.registry.add(existing.model_copy(update={
                 "in_scope": in_scope, "out_of_scope": out_scope,
+                "h1_handle": program_handle,
             }))
             verb = "scope refreshed (seeds kept)"
 
@@ -664,6 +935,50 @@ class HarnessApp(App[None]):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_toggle_active(self) -> None:
+        """Cycle the selected program's active-testing mode:
+        off -> built-in active -> ZAP -> off. Arming asks for confirmation,
+        because it sends crafted attack traffic — owned assets only."""
+        if not self.current_program:
+            self.notify("no program selected", severity="warning")
+            return
+        name = self.current_program
+        prog = self.registry.get(name)
+        if prog is None:
+            return
+
+        # Determine the next state in the cycle.
+        if not prog.active_tests:
+            next_active, next_zap, label = True, False, "active (built-in)"
+        elif prog.active_tests and not prog.use_zap:
+            next_active, next_zap, label = True, True, "active + ZAP"
+        else:
+            next_active, next_zap, label = False, False, "off"
+
+        def apply() -> None:
+            self.registry.add(prog.model_copy(
+                update={"active_tests": next_active, "use_zap": next_zap}))
+            self.registry.save(programs_file())
+            self.refresh_programs()
+            self.select_program(name)
+            self.notify(f"'{name}': active testing -> {label}",
+                        severity="warning" if next_active else "information")
+
+        if next_active and not prog.active_tests:
+            # Arming from off — confirm, since this enables attack traffic.
+            def confirmed(ok: bool | None) -> None:
+                if ok:
+                    apply()
+            self.push_screen(
+                ConfirmScreen(
+                    f"Enable active testing on '{name}'? This sends crafted "
+                    "attack traffic — only for assets you own.",
+                    confirm_label="Enable"),
+                confirmed,
+            )
+        else:
+            apply()
 
     def action_delete(self) -> None:
         if not self.current_program:

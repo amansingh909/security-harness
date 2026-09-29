@@ -72,7 +72,8 @@ class TechProber:
         )
         timeout = httpx.Timeout(self._s.http_timeout, connect=self._s.connect_timeout)
         self._client = httpx.AsyncClient(
-            headers={"User-Agent": self._s.user_agent},
+            headers={"User-Agent": self._s.user_agent,
+                     **(self._s.extra_request_headers or {})},
             timeout=timeout,
             limits=limits,
             verify=self._s.verify_tls,

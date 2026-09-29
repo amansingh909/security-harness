@@ -1,8 +1,10 @@
 # security-harness
 
 A toolkit for **authorized** vulnerability research and bug-bounty work, built as
-four independent components that interlock through shared data. One long-running
-service (a CVE knowledge base) plus three tools that read from it.
+four independent components that interlock through shared data, driven by a
+front-door harness that runs the whole loop **headless** — recon → triage → a
+review queue you work in the TUI. One long-running service (a CVE knowledge base)
+plus three tools that read from it.
 
 Each component lives in its own repo and is independently installable, testable,
 and deployable. This document is the map: what each does, how they connect, and
@@ -11,36 +13,47 @@ how to run the whole thing.
 ## Scope & ethics (read first)
 
 This harness is for testing you are **authorized** to perform — an active bug
-bounty program you're enrolled in, a lab, or an asset you own.
+bounty program you're enrolled in, a lab, or an asset you own. Every program
+carries a **mode** that decides how far the machine may go on its own:
 
-- The recon component **refuses to run without an explicit authorized scope**,
-  probes only hosts that clearly match that scope, and sends **GET/HEAD only** —
-  no exploit payloads, no parameter injection, no evasion, no IP rotation.
-- Every recon result is labelled **UNVERIFIED — manual verification required**.
-  The harness surfaces *leads*; a human confirms them.
-- The report generator **will not fabricate evidence** — it requires real repro
-  steps, an observed result, and impact, and refuses to build a report without
-  them.
+- **`real` programs** (a live bug-bounty target) stay **passive**: scope-gated
+  recon that **refuses to run without an explicit authorized scope**, probes only
+  hosts that clearly match it, and sends **GET/HEAD only** — no exploit payloads,
+  no parameter injection, no evasion, no IP rotation. Results are labelled
+  **UNVERIFIED — manual verification required**; the machine surfaces *leads*, a
+  human confirms them. A `real` program is forced passive on every autonomous run
+  regardless of any other flag.
+- **`practice` programs** are **intentionally-vulnerable targets you own or are
+  meant to exploit** (a local Juice Shop / DVWA, the public Acunetix vulnweb
+  sites). Only these arm the active engine — crawl, parameter discovery, and
+  crafted-input probing — because there is no third party to harm.
 
-By design, there is **no autonomous exploitation loop and no model trained to
-optimize successful break-ins.** That was deliberately left out; what's here
-finds and organizes attack surface for a human to verify.
+Two lines the machine never crosses on its own:
+
+- **No auto-submission, ever.** Nothing in the autonomous path POSTs to a
+  platform. You review each finding, add the evidence you verified by hand, and
+  submit it yourself from the TUI.
+- **No fabricated evidence.** The report builder requires real reproduction
+  steps, an observed result, and impact, and **refuses** to build or submit a
+  report without them — an unverified scan lead is never dressed up as a finding.
 
 ## Components
 
 | Component | Repo | Role | Runtime |
 |-----------|------|------|---------|
-| **harness** | [`harness`](harness) | TUI/CLI front door that drives all of the below | Interactive TUI |
+| **harness** | [`harness`](harness) | Front door: headless `auto` runner + a TUI review/submit cockpit driving all of the below | TUI + headless CLI |
 | **cve-index** | [`cve-index`](cve-index) | Hybrid Elasticsearch + FAISS search over NVD + MITRE ATT&CK | Long-running service (API) |
 | **cve-classifier** | [`cve-classifier`](cve-classifier) | QLoRA fine-tune → CVE severity + CWE classification | GPU batch job / inference |
 | **recon-orchestrator** | [`recon-orchestrator`](recon-orchestrator) | Scope-gated, rate-limited recon → ranked candidate leads | Run-to-completion job |
 | **bounty-reporter** | [`bounty-reporter`](bounty-reporter) | Structured finding → HackerOne/Bugcrowd JSON + Markdown + CVSS | CLI |
 
-**Start here:** [`harness`](harness) is the front door — a Textual TUI where you
-define a program once, then press `r` to run recon, browse ranked leads, and `w`
-to scaffold a report. It calls the four components below so you don't have to
-juggle their individual commands. The per-component docs are still the reference
-for what each does under the hood.
+**Start here:** [`harness`](harness) is the front door. Define a program once,
+then either let it run unattended — `harness auto` does recon + scan for every
+program and fills a review queue — or open the TUI (`harness`) and press `f` to
+work that queue: read each finding, mark it, add the evidence you verified, and
+submit it. It calls the four components below so you don't juggle their
+individual commands. The per-component docs remain the reference for the
+internals.
 
 ## How they connect
 
@@ -48,19 +61,29 @@ for what each does under the hood.
 flowchart TD
     NVD[NVD API 2.0] --> IDX[cve-index<br/>ES + FAISS]
     ATTACK[MITRE ATT&CK] --> IDX
-    IDX -->|training data<br/>doc_type:cve| CLS[cve-classifier<br/>QLoRA adapter]
     IDX -->|/search product+version| RECON[recon-orchestrator]
-    SCOPE[authorized scope] --> RECON
-    RECON -->|candidate leads<br/>UNVERIFIED| HUMAN{{manual<br/>verification}}
-    CLS -.->|severity / CWE triage| HUMAN
-    HUMAN -->|confirmed finding| RPT[bounty-reporter]
-    RPT --> H1[HackerOne JSON]
-    RPT --> BC[Bugcrowd JSON]
-    RPT --> MD[Markdown report]
+    SCOPE[authorized scope + mode] --> RECON
+    RECON -->|real: passive GET/HEAD| LEADS[candidate leads<br/>UNVERIFIED]
+    RECON -->|practice: active engine| LEADS
+    IDX -.->|training data| CLS[cve-classifier<br/>severity / CWE]
+    LEADS --> QUEUE[[review queue<br/>harness auto]]
+    CLS -.-> QUEUE
+    QUEUE --> HUMAN{{TUI review<br/>verify + add evidence}}
+    HUMAN -->|verified finding| RPT[bounty-reporter<br/>+ humanizer prose]
+    RPT -->|you press submit| H1[HackerOne / Bugcrowd]
 ```
 
 `cve-index` is the hub: the classifier trains on it, recon correlates
 fingerprints against it, and the reporter can verify CVE references against it.
+
+## Running it autonomously (agents)
+
+An agent (or cron) driving the whole loop unattended follows
+[`AGENTS.md`](AGENTS.md) — the operator playbook: read a program's requirements
+(`harness show-policy`), configure the harness to meet them (`harness
+import-scope`, `harness set-header`), run it (`harness auto`), and triage what to
+look for — with the bright lines it must never cross (real programs stay passive,
+required headers must be set, never auto-submit).
 
 ## End-to-end run
 
@@ -76,23 +99,41 @@ cve-index ingest --mode full         # fetch → embed → index → alias-swap 
 cve-index serve                      # http://localhost:8080
 ```
 
-### 2. Run the full pipeline for all programs (optional one‑shot command)
-
-Once the services are up, you can execute the entire workflow for every defined program with a single command:
+### 2. Add programs and run headless
 
 ```bash
-harness global
+harness seed-practice                # adds the vulnweb practice program (mode=practice)
+harness import-scope <handle>        # pull a real HackerOne program's scope (or press `i` in the TUI)
+harness auto                         # recon + scan every program, fill the review queue
+harness auto --programs vulnweb      # or scope a run to a subset
 ```
 
-This will:
-- Run the nightly pipeline (sub‑domain enumeration → port sweep → CPE‑based CVE lookup → sensitive‑path checks → scope import → scoring).
-- Open the Triage dashboard so you can review ranked findings.
-- Generate a consolidated Markdown + JSON report for each program under `~/hunts/<program>/`.
-- Prompt once for HackerOne / Bugcrowd API keys (leave blank to skip upload) and, if supplied, POST the findings to the platforms.
+`harness auto` is non-interactive — no TUI, no prompts, **no upload** — so it is
+safe to run from cron or an agent. It **refreshes every HackerOne-imported
+program's scope from the API first** (so a run never works off a stale copy),
+starts the services, ingests the CVE corpus once if the index is empty, runs each
+program **in its mode** (real → passive GET/HEAD, practice → active engine), and
+writes per-finding records to `~/hunts/<program>/findings/`.
 
-All steps remain GET/HEAD‑only for recon and POST‑only for upload, require manual review before any data leaves your machine, and respect the program‑level allow/deny lists.
+> A real HackerOne program is imported **passive** (real mode). Only add one you
+> may actually scan: check the program's automation policy — an asset can be in
+> scope while automated scanning is against that program's rules.
 
-### 2. (Optional) Train the CVE classifier on that corpus
+### 3. Review and submit in the TUI
+
+```bash
+harness                              # opens the cockpit; press f for the review queue
+```
+
+In the **Findings** queue, `r`/`f`/`x` mark a finding real / false / duplicate;
+**Enter** opens it to add the evidence you verified by hand, **Ctrl+D** previews
+the report (prose run through the humanizer, evidence left untouched), and
+**Ctrl+S** submits it — with a confirm, only if the evidence is real and your API
+keys are set in `~/.harness/.env`. Submission is the one action that POSTs, and it
+only happens on your keypress. (`harness global` is the older interactive variant
+of the same pipeline.)
+
+### 4. (Optional) Train the CVE classifier on that corpus
 
 ```bash
 cd ~/security-harness/cve-classifier
@@ -103,7 +144,7 @@ cve-classifier train                 # QLoRA (GPU; 1.5B 4-bit fits ~4GB VRAM)
 cve-classifier evaluate              # accuracy + macro-F1 for severity and CWE
 ```
 
-### 3. Run scoped recon against an authorized target
+### 5. Run scoped recon directly (component-level)
 
 ```bash
 cd ~/security-harness/recon-orchestrator
@@ -116,7 +157,7 @@ export RECON_CVE_INDEX_URL=http://localhost:8080   # correlate versions → CVEs
 recon-orchestrator run > candidates.json           # ranked leads, all UNVERIFIED
 ```
 
-### 4. After you verify a lead by hand, write it up
+### 6. Write up a finding directly (component-level)
 
 ```bash
 cd ~/security-harness/bounty-reporter
@@ -154,8 +195,11 @@ pip install -e '.[dev]' && pytest
 | bounty-reporter | CVSS vectors, model validation, dedup, taxonomy, generation | — (fully covered) |
 | recon-orchestrator | scope logic, fingerprint, triage, rate limiter, pipeline | live hosts for a real probe run |
 
-Verified without infrastructure: **82 unit tests across the four repos, all
-passing.** The CVSS v3.1 calculator is checked against known vectors
+Verified without infrastructure: **246 unit tests across the harness,
+recon-orchestrator, and bounty-reporter suites, all passing** — covering the
+mode/passive-vs-active bright line, the finding store, the humanizer, and the
+uploader's refusal to submit unverified leads. The CVSS v3.1 calculator is
+checked against known vectors
 (Log4Shell 10.0, `AV:N…C:H` 7.5, IDOR 6.5, null-impact 0.0); the scope guard is
 checked against wildcard/exclusion/CIDR rules and the `example.com.evil.com`
 bypass.

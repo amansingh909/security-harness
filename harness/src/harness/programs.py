@@ -4,6 +4,7 @@ Persisted as YAML so it's human-editable outside the TUI too."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -18,6 +19,22 @@ class Program(BaseModel):
     cve_index_url: str | None = None
     requests_per_second: float = 2.0
     allow_multilevel_wildcard: bool = True
+    # Active testing — OWNED ASSETS ONLY, per program so it can never be a
+    # global switch. active_tests turns on crafted-input probing; use_zap
+    # routes it through OWASP ZAP (creds come from the environment).
+    active_tests: bool = False
+    use_zap: bool = False
+    # Autonomous run mode. "real" = passive GET/HEAD recon only, never attack
+    # traffic (real in-scope programs). "practice" = arm the active engine, for
+    # intentionally-vulnerable practice targets you own or are meant to exploit.
+    mode: Literal["real", "practice"] = "real"
+    # Set when imported from HackerOne, so `harness auto` can re-pull fresh scope
+    # before each run instead of working off a stale copy.
+    h1_handle: str | None = None
+    # Headers put on EVERY request to this program's assets (e.g. a program's
+    # required testing header like `X-Bug-Bounty: HackerOne-<user>`). A program
+    # that requires one forfeits the reward if any request is missing it.
+    extra_headers: dict[str, str] = Field(default_factory=dict)
     notes: str = ""
 
     def is_runnable(self) -> tuple[bool, str]:

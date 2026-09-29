@@ -40,3 +40,27 @@ def test_registry_remove(tmp_path):
     assert reg.remove("acme") is True
     assert reg.remove("acme") is False
     assert reg.names() == []
+
+
+def test_program_mode_defaults_to_real():
+    """A program is passive-only ('real') unless explicitly set to 'practice'."""
+    assert Program(name="x").mode == "real"
+
+
+def test_program_h1_handle_defaults_to_none():
+    """Only programs imported from HackerOne carry a handle to refresh from."""
+    assert Program(name="x").h1_handle is None
+
+
+def test_program_extra_headers_default_empty():
+    """Per-program headers (e.g. a program's required testing header) start empty."""
+    assert Program(name="x").extra_headers == {}
+
+
+def test_program_mode_roundtrips_through_yaml(tmp_path):
+    reg = Registry()
+    reg.add(Program(name="lab", in_scope=["localhost"], seeds=["localhost"],
+                    mode="practice"))
+    path = tmp_path / "programs.yaml"
+    reg.save(path)
+    assert Registry.load(path).get("lab").mode == "practice"

@@ -16,6 +16,24 @@ class ComponentMissing(RuntimeError):
     """A required sibling component isn't importable/installed."""
 
 
+def _target_headers(program: Program) -> dict[str, str]:
+    """Headers to put on EVERY request to a program's assets.
+
+    Program-required testing headers (e.g. ``X-Bug-Bounty``) plus the Vercel
+    protection-bypass header when configured. A program that requires a header
+    forfeits the reward if any request is missing it, so both the recon prober
+    and the separate scan/fingerprint client build their headers from here.
+    """
+    import os
+
+    headers: dict[str, str] = dict(program.extra_headers or {})
+    bypass = os.getenv("VERCEL_AUTOMATION_BYPASS_SECRET")
+    if bypass:
+        headers["x-vercel-protection-bypass"] = bypass
+        headers["x-vercel-set-bypass-cookie"] = "true"
+    return headers
+
+
 async def run_recon(program: Program) -> list[dict]:
     """Run recon for a program via recon_orchestrator; return candidate leads."""
     try:
@@ -39,9 +57,20 @@ async def run_recon(program: Program) -> list[dict]:
         except OSError as exc:
             raise ComponentMissing(f"seeds_file unreadable: {exc}") from exc
 
+    import os
+
+    # Program-required testing headers + any Vercel bypass, on every request.
+    extra_headers = _target_headers(program)
     settings = Settings(
         requests_per_second=program.requests_per_second,
         cve_index_url=program.cve_index_url,
+        # Active testing is per-program and owned-assets-only. ZAP credentials
+        # come from the environment (~/.harness/.env), never the program file.
+        active_tests=program.active_tests,
+        use_zap=program.use_zap,
+        zap_api_url=os.getenv("ZAP_API_URL"),
+        zap_api_key=os.getenv("ZAP_API_KEY"),
+        extra_request_headers=extra_headers,
     )
     scope = ScopeGuard(
         program.in_scope, program.out_of_scope, program.allow_multilevel_wildcard
@@ -107,6 +136,82 @@ def render_report(finding_path: str) -> dict:
     }
 
 
+def _humanize_evidence(evidence: dict) -> dict:
+    """Return a copy of a finding dict with only its NARRATIVE fields de-AI'd.
+
+    Humanizes summary / impact / remediation; leaves reproduction steps,
+    request/response, observed_result, and CVSS byte-for-byte — the humanizer
+    never gets a second chance to touch evidence.
+    """
+    from .humanizer import humanize
+
+    out = dict(evidence)
+    for field in ("summary", "impact", "remediation"):
+        if out.get(field):
+            out[field] = humanize(out[field])
+    return out
+
+
+def draft_report(finding: dict) -> str:
+    """Render a submittable Markdown report from a VERIFIED finding, prose humanized.
+
+    Builds a bounty_reporter Finding (which refuses missing or blank evidence)
+    from the humanized finding, then renders Markdown. Raises ValueError if the
+    finding lacks real evidence.
+    """
+    try:
+        from bounty_reporter.generator import generate
+        from bounty_reporter.models import Finding
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise ComponentMissing(
+            "bounty-reporter not installed. Run: pip install -e ../bounty-reporter"
+        ) from exc
+
+    model = Finding.from_dict(_humanize_evidence(finding))
+    return generate(model).markdown
+
+
+def submit_finding(
+    evidence: dict,
+    program: str,
+    *,
+    h1_key: str | None = None,
+    bc_key: str | None = None,
+    h1_identifier: str | None = None,
+) -> dict:
+    """Submit ONE verified finding to the program(s), prose humanized.
+
+    Humanizes the narrative fields, refuses up front if the evidence is missing
+    or blank (so nothing unverified is ever sent), writes a one-item batch and
+    POSTs it through the anti-fabrication uploader. Returns the uploader's
+    ``{hackerone, bugcrowd}`` result.
+    """
+    try:
+        from bounty_reporter.models import Finding
+        from bounty_reporter.uploader import upload_report
+    except ImportError as exc:  # pragma: no cover - env dependent
+        raise ComponentMissing(
+            "bounty-reporter not installed. Run: pip install -e ../bounty-reporter"
+        ) from exc
+
+    import json
+    import os as _os
+    import tempfile
+
+    humanized = _humanize_evidence({**evidence, "program": program})
+    Finding.from_dict(humanized)  # raises ValueError if evidence is missing/blank
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as fh:
+        json.dump({"vulnerabilities": [humanized]}, fh)
+        path = fh.name
+    try:
+        return upload_report(path, program, h1_key, bc_key, h1_identifier)
+    finally:
+        _os.unlink(path)
+
+
 def available() -> dict[str, bool]:
     """Which sibling components are importable in this environment."""
     import importlib.util
@@ -159,8 +264,11 @@ async def scan_for_vulns(program: Program, leads: list[dict]) -> list[dict]:
 
     vulns = []
 
-    # Use a reasonable timeout and limit concurrent requests
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # Use a reasonable timeout and limit concurrent requests. The scan step has
+    # its own client, so it must carry the program's required headers too.
+    async with httpx.AsyncClient(
+        timeout=10.0, headers=_target_headers(program)
+    ) as client:
         for lead in leads:
             host = lead.get("host")
             if not host:

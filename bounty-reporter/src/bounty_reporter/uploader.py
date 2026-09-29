@@ -33,84 +33,55 @@ from .models import Finding
 from . import hackerone, bugcrowd
 
 
-def _build_finding(
-    program: str,
-    vuln: dict,
-) -> Finding:
-    """Convert a vulnerability dict from the batch report into a Finding.
+# The fields a real, submittable report needs — and that a passive scan can
+# never know. The scanner produces *leads*: it never observes impact, never
+# reproduces anything, never confirms a bug. Inventing these (as this function
+# used to) manufactures evidence, and once POSTed it is exactly the AI-slop
+# submission that gets an account banned. So a Finding is built only from
+# evidence a human has verified onto the finding dict; a raw scan lead is refused.
+_REQUIRED_EVIDENCE = ("vuln_type", "steps_to_reproduce", "observed_result", "impact")
 
-    The batch report dict contains:
-        - host, service (dict with host, port, scheme, server, powered_by,
-          status_code, optional title)
-        - cves: list of dicts with id, cvss_vector, cvss_score,
-          exploit_available
-        - priority_score: float
 
-    We create a minimal Finding with placeholder text for the required
-    fields (steps_to_reproduce, observed_result, impact). The title
-    describes the service; the asset is the host:port. If a CVE is present,
-    we use its CVSS vector and score; otherwise we leave them empty.
+def _build_finding(program: str, finding: dict) -> Finding:
+    """Build a submittable Finding from a *verified* finding dict.
+
+    ``finding`` must already carry human-verified evidence — ``vuln_type``,
+    ``steps_to_reproduce``, ``observed_result`` and ``impact``. A raw scan lead,
+    which has none of these, is not submittable and raises ``ValueError``: the
+    scanner never fabricates impact or reproduction steps.
     """
-    service = vuln.get("service", {})
-    host = service.get("host", "")
+    missing = [field for field in _REQUIRED_EVIDENCE if not finding.get(field)]
+    if missing:
+        service = finding.get("service") or {}
+        where = service.get("host") or finding.get("host") or "this asset"
+        raise ValueError(
+            f"refusing to build a report for {where}: it is an unverified scan "
+            f"lead missing real evidence ({', '.join(missing)}). Verify it and "
+            "complete the finding first — the scanner never fabricates impact or "
+            "reproduction steps."
+        )
+
+    service = finding.get("service") or {}
+    host = service.get("host") or finding.get("host", "")
     port = service.get("port", "")
-    scheme = service.get("scheme", "http")
-    server = service.get("server", "unknown")
-    powered_by = service.get("powered_by", "unknown")
-    title = service.get("title") or f"{scheme.upper()} service on {host}:{port}"
-
-    # Use the first CVE (if any) for CVSS/CWE fields
-    first_cve = vuln.get("cves", [{}])[0] if vuln.get("cves") else {}
-    cvss_vector = first_cve.get("cvss_vector")
-    # cvss_score is read by the caller straight off the vuln dict; Finding has
-    # no field for it.
-    # We don't have CWE from the batch report; leave None.
-    cwe = None
-
-    # Asset string for Bugcrowd
-    asset = f"{host}:{port}" if port else host
-
-    # Finding.vuln_type is required. Name the CVE when we have one, otherwise
-    # describe what the scan actually observed.
-    cve_id = first_cve.get("id")
-    vuln_type = (
-        f"Known vulnerability {cve_id} in exposed service" if cve_id
-        else "Exposed service with potentially vulnerable software version"
-    )
-
-    # steps_to_reproduce is a list[str] with min_length=1 — a single string
-    # fails validation. Include the fingerprint that triggered the match so the
-    # steps are reproducible rather than a bare placeholder.
-    steps = [
-        f"Request {scheme}://{asset} over {scheme.upper()}.",
-        f"Observe the response banner: server={server}, x-powered-by={powered_by}.",
-        (
-            f"Compare that version against {cve_id}."
-            if cve_id
-            else "Compare the reported version against known advisories."
-        ),
-        "See the attached batch report for the full scan output.",
-    ]
-    observed = (
-        f"{host}:{port} responds with server={server!r}, x-powered-by={powered_by!r}"
-        + (f", matching {cve_id}." if cve_id else ".")
-    )
-    impact = "Potential security issue affecting the asset."
+    asset = finding.get("asset") or (f"{host}:{port}" if port else host)
+    first_cve = (finding.get("cves") or [{}])[0]
 
     return Finding(
-        vuln_type=vuln_type,
-        title=title,
-        steps_to_reproduce=steps,
-        observed_result=observed,
-        impact=impact,
-        cvss_vector=cvss_vector,
-        cwe=cwe,
         program=program,
+        vuln_type=finding["vuln_type"],
         asset=asset,
-        # No PoC request/response from the scanner
-        poc_request=None,
-        poc_response=None,
-        references=[],
+        steps_to_reproduce=finding["steps_to_reproduce"],
+        observed_result=finding["observed_result"],
+        impact=finding["impact"],
+        title=finding.get("title") or service.get("title"),
+        affected_param=finding.get("affected_param"),
+        cvss_vector=finding.get("cvss_vector") or first_cve.get("cvss_vector"),
+        cwe=finding.get("cwe"),
+        poc_request=finding.get("poc_request"),
+        poc_response=finding.get("poc_response"),
+        remediation=finding.get("remediation"),
+        references=finding.get("references", []),
     )
 
 
@@ -195,7 +166,18 @@ def upload_report(
         tasks_bc: list[tuple] = []
 
         for vuln in vulns:
-            finding = _build_finding(program, vuln)
+            try:
+                finding = _build_finding(program, vuln)
+            except ValueError as exc:
+                # Unverified scan lead — never POST fabricated evidence. Record
+                # the refusal against each enabled platform and skip it.
+                reason = f"skipped (unverified): {exc}"
+                for key, enabled in (("hackerone", h1_api_key),
+                                     ("bugcrowd", bc_api_key)):
+                    if enabled:
+                        results[key]["failed"] += 1
+                        results[key]["errors"].append(reason)
+                continue
             # The scan already carries a numeric score. Deriving one from the
             # vector string does not work — splitting "CVSS:3.1/AV:N/AC:L" on
             # "/" yields "AV:N", and float("AV:N") raises.

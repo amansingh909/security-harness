@@ -46,3 +46,129 @@ def test_available_reports_components():
     avail = engine.available()
     assert set(avail) == {"recon", "reporter", "classifier"}
     assert all(isinstance(v, bool) for v in avail.values())
+
+
+# --- required testing headers must ride EVERY request to a target -------------
+#
+# Programs like HackerOne's CLEAR require a header (X-Bug-Bounty: HackerOne-<user>)
+# on all traffic or the reward is forfeited. Both the recon prober and the
+# separate scan/fingerprint client must carry it.
+
+def test_run_recon_puts_program_extra_headers_on_the_probe(monkeypatch):
+    import recon_orchestrator.orchestrator as orch
+    captured = {}
+
+    async def fake_run(settings, scope, seeds):
+        captured["headers"] = dict(settings.extra_request_headers or {})
+        return []
+    monkeypatch.setattr(orch, "run_recon", fake_run)
+
+    from harness.programs import Program
+    prog = Program(name="clear", in_scope=["*.clearme.com"], seeds=["clearme.com"],
+                   extra_headers={"X-Bug-Bounty": "HackerOne-88yk"})
+    import asyncio
+    asyncio.run(engine.run_recon(prog))
+    assert captured["headers"].get("X-Bug-Bounty") == "HackerOne-88yk"
+
+
+def test_scan_for_vulns_client_carries_extra_headers(monkeypatch):
+    import httpx
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            captured["headers"] = dict(k.get("headers") or {})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+
+    from harness.programs import Program
+    prog = Program(name="clear", extra_headers={"X-Bug-Bounty": "HackerOne-88yk"})
+    import asyncio
+    asyncio.run(engine.scan_for_vulns(prog, []))  # empty leads: client made, loop skipped
+    assert captured["headers"].get("X-Bug-Bounty") == "HackerOne-88yk"
+
+
+def test_draft_report_humanizes_prose_but_leaves_evidence(monkeypatch):
+    pytest.importorskip("bounty_reporter")
+    import harness.humanizer as hz
+    monkeypatch.setattr(hz, "humanize", lambda text, **k: f"HUMANIZED:{text}")
+
+    finding = {
+        "program": "acme",
+        "vuln_type": "IDOR",
+        "asset": "https://app.acme.com/api/invoices/{id}",
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+        "cwe": "CWE-639",
+        "summary": "The invoice endpoint has no ownership check.",
+        "steps_to_reproduce": ["make two accounts", "GET /api/invoices/4021"],
+        "observed_result": "User B's invoice returned under User A's session.",
+        "impact": "Any user can read any invoice by id.",
+        "remediation": "Enforce an ownership check on the invoice id.",
+    }
+    md = engine.draft_report(finding)
+
+    # prose fields are humanized
+    assert "HUMANIZED:Any user can read any invoice by id." in md
+    assert "HUMANIZED:The invoice endpoint has no ownership check." in md
+    assert "HUMANIZED:Enforce an ownership check on the invoice id." in md
+    # evidence is left byte-for-byte
+    assert "GET /api/invoices/4021" in md
+    assert "HUMANIZED:make two accounts" not in md           # steps not humanized
+    assert "**Observed result:** User B's invoice returned under User A's session." in md
+    assert "HUMANIZED:User B" not in md                       # observed_result not humanized
+
+
+def test_draft_report_refuses_a_finding_without_evidence():
+    pytest.importorskip("bounty_reporter")
+    with pytest.raises(ValueError):
+        engine.draft_report({"program": "p", "vuln_type": "X", "asset": "a"})
+
+
+_VERIFIED_EVIDENCE = {
+    "vuln_type": "IDOR",
+    "asset": "https://app.acme.com/api/invoices/{id}",
+    "steps_to_reproduce": ["make two accounts", "GET /api/invoices/4021"],
+    "observed_result": "User B's invoice returned under User A's session.",
+    "impact": "Any user can read any invoice by id.",
+}
+
+
+def test_submit_finding_humanizes_prose_and_posts_the_verified_finding(monkeypatch):
+    pytest.importorskip("bounty_reporter")
+    import harness.humanizer as hz
+    monkeypatch.setattr(hz, "humanize", lambda text, **k: f"H:{text}")
+
+    captured = {}
+    import bounty_reporter.uploader as up
+
+    def fake_upload(path, program, h1, bc, h1_id=None):
+        import json
+        captured["data"] = json.load(open(path))
+        captured["program"] = program
+        captured["h1"], captured["bc"], captured["h1_id"] = h1, bc, h1_id
+        return {"hackerone": {"sent": 1, "failed": 0, "errors": []},
+                "bugcrowd": {"sent": 0, "failed": 0, "errors": []}}
+    monkeypatch.setattr(up, "upload_report", fake_upload)
+
+    result = engine.submit_finding(_VERIFIED_EVIDENCE, "acme",
+                                   h1_key="k", h1_identifier="id")
+
+    v = captured["data"]["vulnerabilities"][0]
+    assert v["impact"] == "H:Any user can read any invoice by id."   # humanized
+    assert v["observed_result"] == "User B's invoice returned under User A's session."  # untouched
+    assert v["steps_to_reproduce"] == ["make two accounts", "GET /api/invoices/4021"]
+    assert captured["program"] == "acme"
+    assert captured["h1"] == "k" and captured["h1_id"] == "id"
+    assert result["hackerone"]["sent"] == 1
+
+
+def test_submit_finding_refuses_missing_evidence():
+    pytest.importorskip("bounty_reporter")
+    with pytest.raises(ValueError):
+        engine.submit_finding({"vuln_type": "X", "asset": "a"}, "acme",
+                              h1_key="k", h1_identifier="id")

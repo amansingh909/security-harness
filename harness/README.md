@@ -1,7 +1,9 @@
 # harness
 
-One TUI that drives the whole security-harness, so a hunt is menu-driven instead
-of four tools, four `cd`s, and a pile of env vars.
+One front door for the whole security-harness. Run it **headless** — `harness
+auto` recons + scans every program and fills a review queue — or open the **TUI**
+and work that queue. Either way a hunt is menu-driven instead of four tools, four
+`cd`s, and a pile of env vars.
 
 ```
 ┌─ security-harness ───────────────────────────────┐
@@ -33,6 +35,21 @@ of four tools, four `cd`s, and a pile of env vars.
 - **`c` Classify** — classify a CVE/finding description (severity + CWE) via
   `cve-classifier`. Shows a clear "needs training" message until a GPU-trained
   adapter exists.
+
+## Run it headless, review in the TUI
+
+- **`harness auto`** — no TUI, no prompts, **no upload**: recon + scan every
+  program, then write per-finding records to `~/hunts/<program>/findings/`. Safe
+  to run from cron or an agent. `--programs a,b` scopes it to a subset.
+- **`f` Findings** — the review queue across all programs. `r`/`f`/`x` mark a
+  finding real / false / duplicate; **Enter** opens it to add the evidence you
+  verified by hand, **Ctrl+D** previews the report (prose run through the
+  **humanizer**, evidence left untouched), **Ctrl+S** submits it — with a confirm,
+  and the submit is the one action that POSTs.
+- **`harness seed-practice`** — adds the vulnweb practice program (`mode=practice`).
+- **Program `mode`** — `real` programs are forced passive (GET/HEAD only);
+  `practice` programs (intentionally-vulnerable targets) arm the active engine.
+  Set per program in `~/.harness/programs.yaml`.
 
 Results and reports persist per program under `~/hunts/<program>/`.
 

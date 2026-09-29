@@ -20,12 +20,17 @@ from textual.binding import Binding
 import harness
 from harness.tui.app import (
     AddProgramScreen,
+    FindingDetailScreen,
+    FindingsScreen,
     HarnessApp,
+    Input,
     PromptScreen,
+    TextArea,
     TriageScreen,
 )
 
-SCREENS = (AddProgramScreen, PromptScreen, TriageScreen, HarnessApp)
+SCREENS = (AddProgramScreen, FindingDetailScreen, FindingsScreen, PromptScreen,
+           TriageScreen, HarnessApp)
 
 
 def test_every_binding_resolves_to_an_action():
@@ -57,6 +62,13 @@ def test_prompt_screen_takes_its_constructor_arguments():
 
 @pytest.mark.asyncio
 async def test_triage_opens_and_closes():
+    from harness.programs import Program, Registry
+    from harness.paths import ensure_dirs, programs_file
+    ensure_dirs()
+    reg = Registry()
+    reg.add(Program(name="t", in_scope=["*.t.test"], seeds=["t.test"]))
+    reg.save(programs_file())
+
     app = HarnessApp()
     async with app.run_test() as pilot:
         await pilot.press("t")
@@ -87,6 +99,18 @@ async def test_auto_open_triage_env_var(monkeypatch):
     # The flag is consumed so a second app in the same process is unaffected.
     import os
     assert "HARNESS_AUTO_OPEN_TRIAGE" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_auto_open_findings_env_var(monkeypatch):
+    """A launch can drop straight into the review queue via HARNESS_AUTO_OPEN_FINDINGS."""
+    monkeypatch.setenv("HARNESS_AUTO_OPEN_FINDINGS", "1")
+    app = HarnessApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, FindingsScreen)
+    import os
+    assert "HARNESS_AUTO_OPEN_FINDINGS" not in os.environ
 
 
 def test_relative_imports_resolve():
@@ -170,3 +194,110 @@ async def test_scan_persists_findings_so_triage_can_show_them(monkeypatch, tmp_p
 
 async def _async(value):
     return value
+
+
+# --- Findings review screen ---------------------------------------------------
+#
+# The autonomous runner fills a per-finding store; the operator reviews and
+# marks findings here, in the TUI, instead of editing files.
+
+def test_collect_findings_gathers_all_programs_needs_check_first(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path))
+    from harness import findings_store as fs
+    from harness.programs import Program, Registry
+    from harness.tui.app import collect_findings
+
+    reg = Registry()
+    reg.add(Program(name="a", in_scope=["*.a.com"], seeds=["a.com"]))
+    reg.add(Program(name="b", in_scope=["*.b.com"], seeds=["b.com"]))
+
+    fs.save_finding(fs.record_from_vuln(
+        "a", {"host": "h1", "service": {"host": "h1", "port": 80},
+              "cves": [], "priority_score": 5}))
+    r2 = fs.record_from_vuln(
+        "b", {"host": "h2", "service": {"host": "h2", "port": 80},
+              "cves": [], "priority_score": 90})
+    fs.save_finding(r2)
+    fs.update_status("b", r2.id, "false")  # ruled out -> sinks below needs_check
+
+    got = collect_findings(reg)
+    assert [r.program for r in got] == ["a", "b"]
+    assert got[0].status == "needs_check"
+
+
+@pytest.mark.asyncio
+async def test_findings_screen_opens_and_marks_highlighted_finding(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path / "hunts"))
+
+    import harness.tui.app as appmod
+    from harness import findings_store as fs
+    from harness.programs import Program, Registry
+    from harness.paths import ensure_dirs, programs_file
+
+    ensure_dirs()
+    reg = Registry()
+    reg.add(Program(name="t", in_scope=["*.t.test"], seeds=["t.test"]))
+    reg.save(programs_file())
+    rec = fs.record_from_vuln(
+        "t", {"host": "x", "service": {"host": "x", "port": 443},
+              "cves": [], "priority_score": 50})
+    fs.save_finding(rec)
+
+    app = appmod.HarnessApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("f")
+        await pilot.pause()
+        assert isinstance(app.screen, appmod.FindingsScreen), "'f' did not open findings"
+        await pilot.press("r")  # mark the highlighted finding real
+        await pilot.pause()
+
+    assert fs.get_finding("t", rec.id).status == "real"
+
+
+@pytest.mark.asyncio
+async def test_findings_detail_drafts_a_humanized_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("HARNESS_HUNTS", str(tmp_path / "hunts"))
+
+    import harness.tui.app as appmod
+    import harness.humanizer as hz
+    monkeypatch.setattr(hz, "humanize", lambda text, **k: f"H:{text}")
+    from harness import findings_store as fs
+    from harness.programs import Program, Registry
+    from harness.paths import ensure_dirs, programs_file
+
+    ensure_dirs()
+    reg = Registry()
+    reg.add(Program(name="t", in_scope=["*.t.test"], seeds=["t.test"]))
+    reg.save(programs_file())
+    rec = fs.record_from_lead("t", {
+        "host": "x.t.test", "url": "http://x.t.test",
+        "signals": ["reflected input (unencoded) — possible XSS"],
+        "priority_score": 50})
+    fs.save_finding(rec)
+
+    app = appmod.HarnessApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("f")       # open the review queue
+        await pilot.pause()
+        await pilot.press("enter")   # open the highlighted finding
+        await pilot.pause()
+        assert isinstance(app.screen, appmod.FindingDetailScreen)
+
+        # the operator fills in the verified evidence, then drafts
+        app.screen.query_one("#vuln_type", appmod.Input).value = "Reflected XSS"
+        app.screen.query_one("#observed", appmod.Input).value = "marker reflected unencoded"
+        app.screen.query_one("#impact", appmod.Input).value = "script execution in victim session"
+        app.screen.query_one("#steps", appmod.TextArea).text = "load /search?q=<marker>"
+        app.screen.action_draft()
+        await pilot.pause()
+
+        preview = str(app.screen.query_one("#preview", appmod.Static).render())
+        assert "H:script execution in victim session" in preview  # humanized impact
+        assert "load /search?q=<marker>" in preview               # step untouched
+
+    # evidence was persisted to the record
+    assert fs.get_finding("t", rec.id).evidence["vuln_type"] == "Reflected XSS"

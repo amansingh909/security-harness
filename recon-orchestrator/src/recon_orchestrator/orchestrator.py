@@ -49,11 +49,14 @@ class ReconOrchestrator:
 
     async def _probe_one(
         self, prober: HttpProber, host: str
-    ) -> tuple[HostProbe, list[CveCandidate]]:
+    ) -> tuple[HostProbe, list[CveCandidate], list[str]]:
         async with self._sem:
             if self._shutdown.is_set():
-                return HostProbe(host=host, error="skipped: shutting down"), []
+                return HostProbe(host=host, error="skipped: shutting down"), [], []
             probe = await prober.probe(host)
+            active_signals: list[str] = []
+            if self._s.active_tests and not probe.error:
+                active_signals = await self._run_active_tests(prober, probe)
             candidates: list[CveCandidate] = []
             if probe.fingerprints and self._s.cve_index_url and not probe.error:
                 try:
@@ -63,7 +66,7 @@ class ReconOrchestrator:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("cve correlation failed",
                                 extra={"host": host, "error": str(exc)})
-            return probe, candidates
+            return probe, candidates, active_signals
 
     async def _discover_subdomains(self, hosts: list[str]) -> list[str]:
         """Passive subdomain discovery via crt.sh, filtered back through scope.
@@ -170,6 +173,133 @@ class ReconOrchestrator:
                 score += 6
         return signals, score
 
+    async def _run_active_tests(self, prober: HttpProber, probe: HostProbe) -> list[str]:
+        """Active testing for a host — OWNED ASSETS ONLY.
+
+        Reached only when ``active_tests`` is set. Routes to a real OWASP ZAP
+        scan when ``use_zap`` is on, otherwise the lightweight built-in tester.
+        Uses the URL the probe actually reached, so an http-only host or a
+        non-standard port is tested correctly instead of a guessed https URL.
+        """
+        host = probe.host
+        base = (probe.url or f"https://{host}").rstrip("/")
+        # Loud, per-host record that active traffic is being sent.
+        log.warning("active tests enabled — sending crafted input to owned target",
+                    extra={"host": host, "engine": "zap" if self._s.use_zap else "builtin"})
+        if self._s.use_zap:
+            return await self._run_zap(host, base)
+        return await self._run_builtin_active(prober, host, base)
+
+    async def _run_zap(self, host: str, base: str) -> list[str]:
+        """Drive an OWASP ZAP spider + active scan against ``base``.
+
+        Alerts are filtered back through scope, so even if ZAP's spider wandered
+        off-host, only in-scope findings are reported.
+        """
+        from .zap_client import ZapClient, alert_host, alerts_to_signals
+
+        if not self._s.zap_api_url or not self._s.zap_api_key:
+            log.warning("use_zap set but ZAP_API_URL / ZAP_API_KEY are missing",
+                        extra={"host": host})
+            return []
+        extra = self._s.extra_request_headers or {}
+        try:
+            async with ZapClient(self._s.zap_api_url, self._s.zap_api_key) as zap:
+                # Carry bypass/auth headers through ZAP so a protected preview
+                # is reachable; clean the rules up afterward.
+                for hname, hval in extra.items():
+                    await zap.add_request_header(hname, hval)
+                try:
+                    alerts = await zap.scan(base, max_wait=self._s.zap_max_wait)
+                finally:
+                    for hname in extra:
+                        await zap.remove_request_header(hname)
+        except Exception as exc:  # noqa: BLE001 - ZAP down / unreachable
+            log.warning("ZAP scan failed", extra={"host": host, "error": str(exc)})
+            return []
+
+        in_scope = [
+            a for a in alerts
+            if self._scope.verdict(alert_host(a) or host).status == "in"
+        ]
+        signals, _score = alerts_to_signals(in_scope, min_risk=self._s.zap_min_risk)
+        return signals
+
+    async def _run_builtin_active(self, prober: HttpProber, host: str, base: str) -> list[str]:
+        """Lightweight built-in tester: discover a page's inputs, scope-check
+        each, inject the payloads. Marker/signature detection, rate-limited.
+        No external dependency — the fallback when ZAP is not configured.
+        """
+        import httpx
+
+        from . import payloads
+        from .active_discovery import (
+            MAX_CRAWL_PAGES, extract_injection_points, extract_links, inject,
+        )
+
+        # 1. Bounded same-host crawl to discover inputs — many params live a
+        #    page or two deeper than the landing page, so a single fetch misses
+        #    them. Only in-scope pages are visited.
+        points: list = []
+        point_keys: set[tuple[str, str]] = set()
+        visited: set[str] = set()
+        queue: list[str] = [base + "/"]
+        while queue and len(visited) < MAX_CRAWL_PAGES:
+            if self._shutdown.is_set():
+                break
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+            page_host = httpx.URL(url).host
+            if self._scope.verdict(page_host or host).status != "in":
+                continue
+            try:
+                page = await prober.send(httpx.Request("GET", url))
+            except Exception:  # noqa: BLE001
+                continue
+            body = page.text or ""
+            for pt in extract_injection_points(str(page.url), body):
+                key = (pt.url, pt.param)
+                if key not in point_keys:
+                    point_keys.add(key)
+                    points.append(pt)
+            for link in extract_links(str(page.url), body):
+                if link not in visited and httpx.URL(link).host == page_host:
+                    queue.append(link)
+
+        if not points:
+            log.info("active tests: no injectable parameters found",
+                     extra={"host": host, "pages_crawled": len(visited)})
+            return []
+
+        # 2. Inject into each in-scope discovered parameter.
+        signals: list[str] = []
+        seen: set[str] = set()
+        for point in points:
+            if self._shutdown.is_set():
+                break
+            # Never send payloads to a host the scope does not authorize, even
+            # if the page linked to it.
+            if self._scope.verdict(point.host or host).status != "in":
+                continue
+            for test in payloads.TESTS:
+                if self._shutdown.is_set():
+                    break
+                try:
+                    resp = await prober.send(
+                        httpx.Request("GET", inject(point, test.value))
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                desc = payloads.interpret(test, resp.text or "")
+                if desc:
+                    signal = f"{desc} at {point.path} via '{point.param}'"
+                    if signal not in seen:
+                        seen.add(signal)
+                        signals.append(signal)
+        return signals
+
     async def run(self, seeds: list[str], prober: HttpProber | None = None) -> list[CandidateFinding]:
         authorized = self._authorized_seeds(seeds)
         if not authorized:
@@ -197,30 +327,63 @@ class ReconOrchestrator:
         if owns_prober:
             bucket = TokenBucket(self._s.requests_per_second)
             prober = HttpProber(self._s, bucket)
+        tasks = [
+            asyncio.create_task(self._probe_one(prober, host))
+            for host in authorized
+        ]
         try:
-            tasks = [
-                asyncio.create_task(self._probe_one(prober, host))
-                for host in authorized
-            ]
             probes: list[HostProbe] = list(extra_probes)
             cve_by_host: dict[str, list[CveCandidate]] = {}
+            active_by_host: dict[str, list[str]] = {}
             for coro in asyncio.as_completed(tasks):
-                probe, candidates = await coro
+                result = await coro
+                # _probe_one now returns (probe, candidates, active_signals)
+                probe, candidates, active_signals = result
                 probes.append(probe)
                 if candidates:
                     cve_by_host[probe.host] = candidates
+                if active_signals:
+                    active_by_host[probe.host] = active_signals
         finally:
+            # If we exit early (cancelled — you quit the TUI mid-scan), cancel
+            # the in-flight probes so their cleanup runs; a probe driving ZAP
+            # stops the ZAP scan on cancel. Shielded so it completes even while
+            # we ourselves are being cancelled.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
             if owns_prober:
                 await prober.aclose()
 
         findings = triage(probes)
 
+        # Merge CVE candidates and active-test signals into findings.
+        by_host = {f.host: f for f in findings}
+        for finding in findings:
+            finding.cve_candidates = cve_by_host.get(finding.host, [])
+
+        # Active-test hits are near-confirmed vuln indicators (reflected input,
+        # DB errors), so they score high. Attach to the host's finding, or
+        # create one — an active hit on an otherwise-boring host that triage
+        # dropped must still surface.
+        for host, act in active_by_host.items():
+            existing = by_host.get(host)
+            if existing is not None:
+                existing.signals.extend(act)
+                existing.priority_score += len(act) * 5
+            else:
+                new = CandidateFinding(
+                    host=host, url=f"https://{host}",
+                    priority_score=len(act) * 5, signals=list(act),
+                )
+                findings.append(new)
+                by_host[host] = new
+
         # Stage 3: GET-only sensitive-path checks, folded into findings.
         if self._s.enable_sensitive_checks and not self._shutdown.is_set():
             await self._enrich_sensitive(findings, probes)
 
-        for finding in findings:
-            finding.cve_candidates = cve_by_host.get(finding.host, [])
         # Re-sort: enrichment changed scores and may have added hosts.
         findings.sort(key=lambda c: (-c.priority_score, c.host))
         log.info("recon complete",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +37,10 @@ class Settings(BaseSettings):
     backoff_max: float = 30.0
     user_agent: str = "recon-orchestrator/0.1 (authorized security testing)"
     verify_tls: bool = True
+    # Extra headers added to every request (passive probe, built-in active
+    # tester, and ZAP). Used to carry a Vercel deployment-protection bypass
+    # token so a scan can reach a protected preview you own.
+    extra_request_headers: dict[str, str] = Field(default_factory=dict)
 
     # --- recon depth -----------------------------------------------------
     # Discovery + enrichment stages. Subdomain enum (passive, crt.sh) and
@@ -45,6 +50,19 @@ class Settings(BaseSettings):
     enable_subdomain_enum: bool = True
     enable_sensitive_checks: bool = True
     enable_port_sweep: bool = False
+    # Active testing — OWNED ASSETS ONLY. active_tests turns on crafted-input
+    # probing; use_zap routes it through a running OWASP ZAP instead of the
+    # lightweight built-in tester (ZAP is a real DAST engine — spider + active
+    # scan). ZAP creds are read from the environment, never committed.
+    active_tests: bool = False
+    use_zap: bool = False
+    zap_api_url: str | None = None       # e.g. http://localhost:8081
+    zap_api_key: str | None = None
+    zap_max_wait: float = 300.0          # seconds to wait for spider+ascan
+    # Minimum ZAP risk to surface. High/Medium are the real bugs; Low and
+    # Informational are the header/cookie/version-leak nits programs exclude,
+    # so they are dropped by default (and counted, not listed).
+    zap_min_risk: str = "Medium"         # High | Medium | Low | Informational
 
     # --- CVE correlation (optional) --------------------------------------
     cve_index_url: str | None = None     # e.g. http://localhost:8080
