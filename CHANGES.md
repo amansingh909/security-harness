@@ -57,21 +57,21 @@ Turned the harness into a headless autonomous runner with a TUI review/submit
 cockpit, and fixed the blockers that stopped the pipeline from working at all.
 
 ## Added
-- **`harness auto`** — non-interactive run (no TUI / prompts / upload): ensures
+- **`harness auto`**: non-interactive run (no TUI / prompts / upload): ensures
   services, ingests the CVE corpus once if empty, runs recon + scan per program,
   and files per-finding records to `~/hunts/<program>/findings/`. `--programs`
   scopes it to a subset.
-- **`harness seed-practice`** — seeds the vulnweb practice program (5 sites,
+- **`harness seed-practice`**: seeds the vulnweb practice program (5 sites,
   `mode=practice`), idempotent.
-- **Program `mode` (`real` | `practice`)** — `_arm_for_mode` forces real programs
+- **Program `mode` (`real` | `practice`)**: `_arm_for_mode` forces real programs
   passive (GET/HEAD) on every autonomous run; only practice programs arm the
   active engine.
-- **Finding store** (`findings_store.py`) — per-finding records with a mutable
+- **Finding store** (`findings_store.py`): per-finding records with a mutable
   status (needs_check / real / false / duplicate) that survives re-scans, plus
   `signals` / `fingerprints` / `evidence`.
-- **TUI Findings screen** (`f`) — review the queue, mark r/f/x, Enter → a detail
+- **TUI Findings screen** (`f`): review the queue, mark r/f/x, Enter → a detail
   screen to add evidence, Ctrl+D draft (humanized), Ctrl+S submit (with confirm).
-- **Humanizer** (`humanizer.py`) — de-AIs report prose via freeclaude
+- **Humanizer** (`humanizer.py`): de-AIs report prose via freeclaude
   (`HARNESS_HUMANIZER_CMD` to override) with a graceful fallback;
   `engine.draft_report` / `engine.submit_finding` humanize narrative fields only,
   never the evidence.
